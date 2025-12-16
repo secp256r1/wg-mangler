@@ -83,11 +83,11 @@ fn obfuscate(packet: &mut [u8], key: &Key, is_encode: bool) -> Result<()> {
 
 fn new_reuseport_udp_socket(addr: SocketAddrV4) -> Result<UdpSocket> {
     let udp_sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
-    if cfg!(not(target_os = "windows")) {
-        udp_sock.set_reuse_port(true)?;
+    #[cfg(not(windows))]
+    {
+        udp_sock.set_cloexec(true)?;
+        udp_sock.set_nonblocking(true)?;
     }
-    udp_sock.set_cloexec(true)?;
-    udp_sock.set_nonblocking(true)?;
 
     udp_sock.bind(&socket2::SockAddr::from(addr))?;
     let udp_sock: std::net::UdpSocket = udp_sock.into();
@@ -168,12 +168,15 @@ impl Key {
 }
 
 #[inline]
+#[cfg(windows)]
 fn get_cpus_num() -> usize {
-    if cfg!(target_os = "windows") {
-        1
-    } else {
-        num_cpus::get()
-    }
+    1
+}
+
+#[inline]
+#[cfg(not(windows))]
+fn get_cpus_num() -> usize {
+    num_cpus::get()
 }
 
 async fn run_forwarder(args: ForwarderArgs, is_client: bool) -> Result<()> {
