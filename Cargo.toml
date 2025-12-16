@@ -1,0 +1,24 @@
+[package]
+name = "wg-mangler"
+version = "0.1.0"
+edition = "2024"
+description = "a program used to obfuscate WireGuard message headers"
+
+[dependencies]
+tokio = { version = "1.48.0", features = ["full"] }
+clap = { version = "4.5.53", default-features = false, features = ["std", "derive", "help"] }
+anyhow = "1.0.100"
+log = "0.4.29"
+bs58 = "0.5.1"
+num_cpus = "1.17.0"
+socket2 = "0.6.1"
+env_logger = { version = "0.11.8", default-features = false}
+getrandom = { version = "0.3.4", features = ["std"] }
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+

@@ -1,0 +1,46 @@
+name: Build Releases
+on:
+  push:
+    tags:
+      - v*.*.*
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-cross:
+    runs-on: ubuntu-latest
+    env:
+      RUST_BACKTRACE: full
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - armv7-unknown-linux-gnueabihf
+          - armv7-unknown-linux-musleabihf
+          - arm-unknown-linux-gnueabihf
+          - arm-unknown-linux-musleabihf
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+          - aarch64-apple-darwin
+          - x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: create artifacts
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf wg-mangler_${{ matrix.target }}.tar.gz wg-mangler
+
+      - name: Upload Github Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/${{ matrix.target }}/release/*.tar.gz
+          prerelease: ${{ contains(github.ref, '-') }}
+          update_existing: true
