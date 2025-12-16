@@ -30,13 +30,17 @@ jobs:
             runs-on: ubuntu-latest
             target: riscv64gc-unknown-linux-gnu
 
+          - os-name: macOS-aarch64
+            runs-on: macOS-latest
+            target: aarch64-apple-darwin
+
           - os-name: macOS-x86_64
             runs-on: macOS-latest
             target: x86_64-apple-darwin
 
-          - os-name: macOS-aarch64
-            runs-on: macOS-latest
-            target: aarch64-apple-darwin
+          - os-name: Windows-x86_64
+            runs-on: windows-latest
+            target: x86_64-pc-windows-msvc
 
 
     runs-on: ${{ matrix.platform.runs-on }}
@@ -55,3 +59,5 @@ jobs:
         with:
           executable-name: wg-mangler
           target: ${{ matrix.platform.target }}
+          extra-files: ''
+          changes-file: ''

@@ -83,7 +83,9 @@ fn obfuscate(packet: &mut [u8], key: &Key, is_encode: bool) -> Result<()> {
 
 fn new_reuseport_udp_socket(addr: SocketAddrV4) -> Result<UdpSocket> {
     let udp_sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
-    udp_sock.set_reuse_port(true)?;
+    if cfg!(not(target_os = "windows")) {
+        udp_sock.set_reuse_port(true)?;
+    }
     udp_sock.set_cloexec(true)?;
     udp_sock.set_nonblocking(true)?;
 
@@ -165,6 +167,15 @@ impl Key {
     }
 }
 
+#[inline]
+fn get_cpus_num() -> usize {
+    if cfg!(target_os = "windows") {
+        1
+    } else {
+        num_cpus::get()
+    }
+}
+
 async fn run_forwarder(args: ForwarderArgs, is_client: bool) -> Result<()> {
     info!("Listening on: {}", args.listen);
 
@@ -175,7 +186,7 @@ async fn run_forwarder(args: ForwarderArgs, is_client: bool) -> Result<()> {
         .next()
         .ok_or_else(|| anyhow!("invalid forward address"))?;
 
-    for _ in 0..num_cpus::get() {
+    for _ in 0..get_cpus_num() {
         let key = key.clone();
         tokio::spawn(async move {
             let main_socket = match new_reuseport_udp_socket(args.listen) {
