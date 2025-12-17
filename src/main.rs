@@ -50,8 +50,8 @@ fn xor_transform(data: &mut [u8], key: &[u8; 8]) {
     }
 }
 
-fn obfuscate(packet: &mut [u8], key: &Key, is_encode: bool) -> Result<()> {
-    if packet.len() < 12 {
+fn obfuscate(packet: &mut [u8], len: usize, key: &Key, is_encode: bool) -> Result<usize> {
+    if packet.len() < 16 {
         bail!("invalid message length");
     }
 
@@ -70,25 +70,44 @@ fn obfuscate(packet: &mut [u8], key: &Key, is_encode: bool) -> Result<()> {
         (message_type, used_key)
     };
 
-    match message_type {
+    Ok(match message_type {
         // data
-        4 => xor_transform(&mut packet[4..12], used_key),
+        4 => {
+            xor_transform(&mut packet[4..16], used_key);
+            len
+        }
         // handshake and cookie
-        0..=3 => xor_transform(&mut packet[4..], used_key),
+        1..=3 => {
+            if is_encode {
+                xor_transform(&mut packet[4..], used_key);
+                let padding_size = (getrandom::u32()? as u8) as usize;
+                let padding_len = len + padding_size;
+                getrandom::fill(&mut packet[len..padding_len])?;
+                padding_len
+            } else {
+                let size = match message_type {
+                    1 => 148,
+                    2 => 92,
+                    3 => 64,
+                    _ => unreachable!(),
+                };
+                xor_transform(&mut packet[4..size], used_key);
+                size
+            }
+        }
         x => bail!("invalid message type: {x}"),
-    }
-
-    Ok(())
+    })
 }
 
 fn new_reuseport_udp_socket(addr: SocketAddrV4) -> Result<UdpSocket> {
     let udp_sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
     #[cfg(not(windows))]
     {
+        udp_sock.set_reuse_port(true)?;
         udp_sock.set_cloexec(true)?;
-        udp_sock.set_nonblocking(true)?;
     }
 
+    udp_sock.set_nonblocking(true)?;
     udp_sock.bind(&socket2::SockAddr::from(addr))?;
     let udp_sock: std::net::UdpSocket = udp_sock.into();
     Ok(udp_sock.try_into()?)
@@ -108,13 +127,16 @@ async fn handle_reverse_traffic(
         match tokio::time::timeout(timeout_duration, proxy_socket.recv_from(&mut buf)).await {
             Ok(Ok((len, from_addr))) => {
                 debug!("Reverse: Received {len} bytes from {from_addr}");
-                let data = &mut buf[..len];
 
-                if let Err(e) = obfuscate(data, key, !is_client) {
-                    error!("[Session {original_src}] Failed to obfuscate original source: {e}");
-                }
+                let trim_len = match obfuscate(&mut buf[..], len, key, !is_client) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("[Session {original_src}] Failed to obfuscate original source: {e}");
+                        continue;
+                    }
+                };
 
-                if let Err(e) = main_socket.send_to(data, original_src).await {
+                if let Err(e) = main_socket.send_to(&buf[..trim_len], original_src).await {
                     error!(
                         "[Session {original_src}] Failed to send packet back to original source: {e}",
                     );
@@ -213,7 +235,7 @@ async fn run_forwarder(args: ForwarderArgs, is_client: bool) -> Result<()> {
                         continue;
                     }
                 };
-                debug!("Forward: Received {len} bytes from {src_addr}");
+                debug!("listen socket: received {len} bytes from {src_addr}");
 
                 let proxy_socket = match sessions.write().await.entry(src_addr) {
                     Entry::Occupied(entry) => entry.get().clone(),
@@ -252,15 +274,18 @@ async fn run_forwarder(args: ForwarderArgs, is_client: bool) -> Result<()> {
                     }
                 };
 
-                let data_to_forward = &mut buf[..len];
+                let padding_len = match obfuscate(&mut buf[..], len, &key, is_client) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("[Session {src_addr}] Failed to obfuscate packet: {e}");
+                        continue;
+                    }
+                };
 
-                debug!("Forward: {} bytes for forwarding", data_to_forward.len());
-
-                if let Err(e) = obfuscate(data_to_forward, &key, is_client) {
-                    error!("[Session {src_addr}] Failed to obfuscate packet: {e}");
-                }
-
-                if let Err(e) = proxy_socket.send_to(data_to_forward, forward_addr).await {
+                if let Err(e) = proxy_socket
+                    .send_to(&buf[..padding_len], forward_addr)
+                    .await
+                {
                     error!("[Session {src_addr}] Failed to send_to packet: {e}");
                 }
             }
