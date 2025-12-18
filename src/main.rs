@@ -13,6 +13,7 @@ use tokio::{net::UdpSocket, sync::RwLock};
 
 const MAX_UDP_SIZE: usize = u16::MAX as usize;
 const DERIVED_KEY_NUM: usize = 64;
+const DERIVED_KEY_LEN: usize = 8;
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -51,19 +52,15 @@ fn xor_transform(data: &mut [u8], key: &[u8; 8]) {
 }
 
 fn obfuscate(packet: &mut [u8], len: usize, key: &Key, is_encode: bool) -> Result<usize> {
-    if packet.len() < 16 {
-        bail!("invalid message length");
-    }
-
     let (message_type, used_key) = if is_encode {
         let message_type = packet[0];
         packet[0..4].copy_from_slice(getrandom::u32()?.to_le_bytes().as_slice());
-        let used_key = key.get(packet[2]);
-        packet[3] = message_type ^ used_key[0];
+        let used_key = key.get(&packet[..2])?;
+        packet[3] = message_type ^ Key::get_key_byte(used_key, packet[2]);
         (message_type, used_key)
     } else {
-        let used_key = key.get(packet[2]);
-        let message_type = packet[3] ^ used_key[0];
+        let used_key = key.get(&packet[..2])?;
+        let message_type = packet[3] ^ Key::get_key_byte(used_key, packet[2]);
 
         packet[0] = message_type;
         packet[1..4].copy_from_slice([0u8; 3].as_slice());
@@ -80,7 +77,7 @@ fn obfuscate(packet: &mut [u8], len: usize, key: &Key, is_encode: bool) -> Resul
         1..=3 => {
             if is_encode {
                 xor_transform(&mut packet[4..], used_key);
-                let padding_size = (getrandom::u32()? as u8) as usize;
+                let padding_size = (getrandom::u32()? as u8 % 64) as usize;
                 let padding_len = len + padding_size;
                 getrandom::fill(&mut packet[len..padding_len])?;
                 padding_len
@@ -169,11 +166,11 @@ fn generate_key() -> Result<()> {
 }
 
 #[derive(Clone)]
-struct Key([[u8; 8]; DERIVED_KEY_NUM]);
+struct Key([[u8; DERIVED_KEY_LEN]; DERIVED_KEY_NUM]);
 
 impl Key {
     fn new(seed: [u8; 32]) -> Key {
-        let mut derived = [[0u8; 8]; DERIVED_KEY_NUM];
+        let mut derived = [[0u8; DERIVED_KEY_LEN]; DERIVED_KEY_NUM];
         for (i, v) in derived.iter_mut().enumerate() {
             let mut hasher = DefaultHasher::new();
             hasher.write(&seed);
@@ -184,8 +181,14 @@ impl Key {
         Key(derived)
     }
 
-    fn get(&self, index: u8) -> &[u8; 8] {
-        &self.0[index as usize % DERIVED_KEY_NUM]
+    fn get(&self, index: &[u8]) -> Result<&[u8; DERIVED_KEY_LEN]> {
+        let index: [u8; 2] = index.try_into()?;
+        let index = u16::from_le_bytes(index);
+        Ok(&self.0[index as usize % DERIVED_KEY_NUM])
+    }
+
+    fn get_key_byte(key: &[u8; DERIVED_KEY_LEN], index: u8) -> u8 {
+        key[index as usize % DERIVED_KEY_LEN]
     }
 }
 
