@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use log::{debug, error, info};
-use tokio::{net::UdpSocket, sync::RwLock};
+use tokio::{net::UdpSocket, spawn, sync::RwLock};
 
 const MAX_UDP_SIZE: usize = u16::MAX as usize;
 const DERIVED_KEY_NUM: usize = 64;
@@ -110,9 +110,9 @@ fn new_reuseport_udp_socket(addr: SocketAddrV4) -> Result<UdpSocket> {
     Ok(udp_sock.try_into()?)
 }
 
-async fn handle_reverse_traffic(
+async fn handle_forward_socket(
     is_client: bool,
-    main_socket: Arc<UdpSocket>,
+    listen_socket: Arc<UdpSocket>,
     proxy_socket: Arc<UdpSocket>,
     original_src: SocketAddr,
     key: &Key,
@@ -133,7 +133,7 @@ async fn handle_reverse_traffic(
                     }
                 };
 
-                if let Err(e) = main_socket.send_to(&buf[..trim_len], original_src).await {
+                if let Err(e) = listen_socket.send_to(&buf[..trim_len], original_src).await {
                     error!(
                         "[Session {original_src}] Failed to send packet back to original source: {e}",
                     );
@@ -217,24 +217,24 @@ async fn run_forwarder(args: ForwarderArgs, is_client: bool) -> Result<()> {
     for _ in 0..get_cpus_num() {
         let key = key.clone();
         tokio::spawn(async move {
-            let main_socket = match new_reuseport_udp_socket(args.listen) {
+            let listen_socket = match new_reuseport_udp_socket(args.listen) {
                 Ok(v) => v,
                 Err(e) => {
-                    error!("can not create the main_socket: {e}");
+                    error!("can not create the listen_socket: {e}");
                     return;
                 }
             };
-            let main_socket = Arc::new(main_socket);
-            let sessions: Arc<RwLock<HashMap<SocketAddr, Arc<UdpSocket>>>> =
+            let listen_socket = Arc::new(listen_socket);
+            let sessions: Arc<RwLock<HashMap<_, Arc<UdpSocket>>>> =
                 Arc::new(RwLock::new(HashMap::new()));
 
             let mut buf = [0u8; MAX_UDP_SIZE];
 
             loop {
-                let (len, src_addr) = match main_socket.recv_from(&mut buf).await {
+                let (len, src_addr) = match listen_socket.recv_from(&mut buf).await {
                     Ok(v) => v,
                     Err(e) => {
-                        error!("main_socket recv_from error: {e}");
+                        error!("listen_socket recv_from error: {e}");
                         continue;
                     }
                 };
@@ -256,22 +256,24 @@ async fn run_forwarder(args: ForwarderArgs, is_client: bool) -> Result<()> {
                         let forwarder_socket = Arc::new(forwarder_socket);
                         entry.insert(forwarder_socket.clone());
 
-                        let task_main_socket = main_socket.clone();
-                        let task_key = key.clone();
-                        let task_sessions = sessions.clone();
-                        let task_forwarder_socket = forwarder_socket.clone();
-                        tokio::spawn(async move {
-                            handle_reverse_traffic(
-                                is_client,
-                                task_main_socket,
-                                task_forwarder_socket,
-                                src_addr,
-                                &task_key,
-                                task_sessions,
-                                timeout_duration,
-                            )
-                            .await;
-                        });
+                        {
+                            let listen_socket = listen_socket.clone();
+                            let key = key.clone();
+                            let sessions = sessions.clone();
+                            let forwarder_socket = forwarder_socket.clone();
+                            spawn(async move {
+                                handle_forward_socket(
+                                    is_client,
+                                    listen_socket,
+                                    forwarder_socket,
+                                    src_addr,
+                                    &key,
+                                    sessions,
+                                    timeout_duration,
+                                )
+                                .await;
+                            });
+                        }
 
                         forwarder_socket
                     }
