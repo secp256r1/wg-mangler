@@ -21,7 +21,7 @@ Its simplicity is a key feature: it requires no `tun` devices and no `nftables` 
 ## Features
 
 - **Lightweight Obfuscation:** Hides WireGuard traffic with minimal performance impact.
-- **No Payload Overhead:** WireGuard's MTU remains unchanged as `wg-mangler` doesn't add to the payload size.
+- **Minimal Overhead:** Data packets pass through without any added size; handshake/cookie packets get 0–64 bytes of random padding to hinder length-based fingerprinting.
 - **Simple to Use:** No complex setup, `tun` devices, or firewall rules needed.
 - **Low Resource Usage:** Small memory and CPU footprint.
 - **OpenWrt Support:** Works great on embedded Linux devices.
