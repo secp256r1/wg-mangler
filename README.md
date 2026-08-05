@@ -9,6 +9,8 @@
   - [1. Generate Key](#1-generate-key)
   - [2. Run the Server](#2-run-the-server)
   - [3. Run the Client](#3-run-the-client)
+  - [4. Kernel eBPF Mode (Linux)](#4-kernel-ebpf-mode-linux)
+- [Why Kernel Mode?](#why-kernel-mode)
 - [Acknowledgements](#acknowledgements)
 - [Similar Tools](#similar-tools)
 
@@ -93,6 +95,102 @@ Endpoint = 127.0.0.1:15820
 ```
 
 Now your WireGuard traffic will be seamlessly obfuscated through `wg-mangler`.
+
+### 4. Kernel eBPF Mode (Linux)
+
+The userspace proxy costs one syscall pair + buffer copy + context switch per
+packet. On Linux you can instead run the transform inside the kernel with XDP
+(ingress) and TC (egress) eBPF programs, so packets are mangled in place with
+no userspace involvement — the per-packet overhead drops to a handful of BPF
+instructions.
+
+Build with the `kernel` feature (requires a nightly toolchain with the
+`rust-src` component and `bpf-linker`):
+
+```sh
+rustup toolchain install nightly --profile minimal --component rust-src
+cargo install bpf-linker --locked
+cargo build --release --features kernel
+```
+
+(There is no `rustup target add bpfel-unknown-none` step: the eBPF target's
+standard library is built from source with `-Z build-std=core`, which only
+needs the `rust-src` component. On macOS, `rustup target add bpfel-unknown-none`
+would fail with "no prebuilt artifacts" — ignore it.)
+
+**Cross-compiling with `cross` (e.g. building Linux binaries on macOS):**
+`cross` containers have no nightly/bpf-linker, so build the eBPF program on
+the host first; `build.rs` then reuses that artifact inside the container
+(BPF bytecode is architecture independent, so one build serves all targets):
+
+```sh
+RUSTFLAGS='--cfg=bpf_target_arch="x86_64" -Cdebuginfo=2 -Clink-arg=--btf' \
+  cargo +nightly build -p wg-mangler-ebpf --bins --release \
+  --target bpfel-unknown-none -Z build-std=core
+cross build --release --target x86_64-unknown-linux-musl --features kernel
+```
+
+If the eBPF sources are newer than the prebuilt artifact, `build.rs` falls
+back to `aya-build` and fails inside the container — just rebuild the eBPF
+program again. The release workflow (`.github/workflows/release.yaml`)
+follows this exact pattern automatically.
+
+Then run the same commands as above with `--kernel`:
+
+```sh
+# On your VPS (server side)
+wg-mangler server --listen 0.0.0.0:12345 --forward 127.0.0.1:51820 --key key --kernel
+
+# On your local machine (client side)
+# `--listen` is optional in kernel mode (the client binds nothing locally);
+# the interface is auto-detected from the route to YOUR_VPS_IP.
+wg-mangler client --forward YOUR_VPS_IP:12345 --key key --kernel
+```
+
+Kernel mode needs root and an interface with XDP support. The interface is
+auto-detected (override with `--iface`): the server uses the interface that
+owns its listen address (or the default route for `0.0.0.0`), and the client
+uses the route to the remote endpoint (`--forward` IP) — never its own
+`--listen` address, which is ignored in kernel mode and would otherwise
+resolve to `lo`.
+
+**How the programs fit the no-proxy topology** (WireGuard talks directly to
+`Endpoint = YOUR_VPS_IP:12345`):
+
+> **Switching the client from userspace to kernel mode changes the WG
+> endpoint**: userspace mode proxies on `127.0.0.1` (`Endpoint =
+> 127.0.0.1:<listen port>`), kernel mode requires the *remote* endpoint
+> (`Endpoint = YOUR_VPS_IP:12345`) — kernel mode binds nothing locally
+> (`--listen` is not needed) and only transforms packets on the attached
+> interface. Also make sure the client's WireGuard traffic actually
+> traverses the attached interface (`tc qdisc`/XDP hooks are
+> per-interface); the interface is auto-detected from the route to the
+> peer, or pin it with `--iface`.
+
+```text
+client:  TC egress:  dport == 12345                  → encode
+         XDP ingress: src == VPS && sport == 12345   → decode
+server:  XDP ingress: dport == 12345  → decode + port rewrite → 51820
+         TC egress:  sport == 51820                  → encode (sport → 12345)
+```
+
+Both programs are passive: they only transform matching packets and pass
+everything else through (`XDP_PASS` / `TC_ACT_PIPE`). The checksum fixup is
+fully incremental (verified against kernel `bpf_csum_diff` semantics), so even
+padded handshake packets are trimmed back to their fixed size on the wire.
+The on-wire format is byte-identical to the userspace mode, so a kernel-mode
+peer and a userspace peer interoperate freely.
+
+> Note: the eBPF path applies the XOR transform only. WG peer management,
+> sessions and endpoint logic stay in the kernel's WireGuard implementation
+> (and `wg` userspace tooling), exactly as in an unmangled setup.
+
+### Why Kernel Mode?
+
+The XOR itself is nearly free — the CPU cost of the userspace proxy is the
+per-packet kernel↔userspace crossing: `recvfrom`/`sendto` syscalls, a copy of
+`MAX_UDP_SIZE` bytes per datagram, and two context switches plus task
+scheduling per packet. Kernel mode removes all of that.
 
 ## Acknowledgements
 

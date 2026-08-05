@@ -14,46 +14,81 @@ jobs:
     strategy:
       matrix:
         platform:
+          # Linux release binaries ship the kernel eBPF mode (--kernel), so the
+          # kernel feature must be enabled.
+          # The eBPF ELF is target-independent: build it once here (ubuntu
+          # runner, nightly),
+          # cross builds reuse the artifact via build.rs (see its prebuilt fast path).
           - os-name: Linux-x86_64
             runs-on: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            cargo-args: "--locked --release --features kernel"
 
           - os-name: Linux-aarch64
             runs-on: ubuntu-latest
             target: aarch64-unknown-linux-musl
+            cargo-args: "--locked --release --features kernel"
 
           - os-name: Linux-armv7
             runs-on: ubuntu-latest
             target: armv7-unknown-linux-musleabihf
+            cargo-args: "--locked --release --features kernel"
 
           - os-name: Linux-riscv64
             runs-on: ubuntu-latest
             target: riscv64gc-unknown-linux-gnu
+            cargo-args: "--locked --release --features kernel"
 
+          # macOS / Windows: aya only supports Linux, the kernel feature is
+          # unavailable, keep the default build.
           - os-name: macOS-aarch64
             runs-on: macOS-latest
             target: aarch64-apple-darwin
+            cargo-args: "--locked --release"
 
           - os-name: macOS-x86_64
             runs-on: macOS-latest
             target: x86_64-apple-darwin
+            cargo-args: "--locked --release"
 
           - os-name: Windows-x86_64
             runs-on: windows-latest
             target: x86_64-pc-windows-msvc
-
+            cargo-args: "--locked --release"
 
     runs-on: ${{ matrix.platform.runs-on }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # eBPF toolchain only needed on Linux: nightly (with rust-src for
+      # -Z build-std)
+      # + bpf-linker.
+      - name: Install eBPF toolchain (nightly + rust-src + bpf-linker)
+        if: runner.os == 'Linux'
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+          cargo install bpf-linker --locked
+
+      # Build the eBPF program (bpfel-unknown-none). The artifact lands in the
+      # workspace target/ directory,
+      # cross build containers pick it up via the bind mount -- no BPF
+      # toolchain needed inside the container.
+      - name: Build eBPF program (bpfel-unknown-none)
+        if: runner.os == 'Linux'
+        run: |
+          RUSTFLAGS='--cfg=bpf_target_arch="x86_64" -Cdebuginfo=2 -Clink-arg=--btf' \
+            cargo +nightly build -p wg-mangler-ebpf --bins --release \
+            --target bpfel-unknown-none -Z build-std=core
+
       - name: Build binary
         uses: houseabsolute/actions-rust-cross@v1
         with:
           command: build
           target: ${{ matrix.platform.target }}
-          args: "--locked --release"
+          args: ${{ matrix.platform.cargo-args }}
           strip: true
+
       - name: Publish artifacts and release
         uses: houseabsolute/actions-rust-release@v0
         with:

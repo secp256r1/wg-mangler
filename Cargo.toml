@@ -1,8 +1,18 @@
+[workspace]
+members = ["wg-mangler-ebpf"]
+# Default: build only the main crate; the eBPF sub-crate is built separately
+# for the bpfel target by aya-build.
+default-members = ["."]
+
 [package]
 name = "wg-mangler"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "a program used to obfuscate WireGuard message headers"
+
+[features]
+default = []
+kernel = ["dep:aya"]
 
 [dependencies]
 tokio = { version = "1.53.1", features = ["full"] }
@@ -15,6 +25,16 @@ socket2 = "0.6.5"
 env_logger = { version = "0.11.11", default-features = false }
 getrandom = { version = "0.4.3", features = ["std"] }
 sha2 = "0.11"
+aya = { version = "0.14", optional = true }
+
+# aya-build + cargo_metadata live in the build-dependency graph only on
+# Linux; build.rs decides at runtime whether `--features kernel` is enabled
+# and no-ops otherwise, so the default build is unchanged. (Note: cargo does
+# not support `feature = ...` inside [target.'cfg(..)'] tables, which is why
+# the feature gate lives in build.rs, not here.)
+[target.'cfg(target_os = "linux")'.build-dependencies]
+aya-build = "0.2"
+cargo_metadata = "0.23"
 
 [profile.release]
 strip = true
@@ -23,3 +43,10 @@ lto = true
 codegen-units = 1
 panic = "abort"
 
+# The eBPF crate is built by aya-build with its own RUSTFLAGS (--btf etc.);
+# keep the aggressive strip/lto settings off it — stripped symbols or LTO
+# interfere with the .BTF/license sections the kernel loader expects.
+[profile.release.package.wg-mangler-ebpf]
+strip = "none"
+opt-level = "s"
+codegen-units = 16

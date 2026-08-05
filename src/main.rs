@@ -5,12 +5,20 @@ use std::{
     time::Duration,
 };
 
+// `Ipv4Addr` is only referenced by the kernel-mode client fallback listen
+// address, so gate it behind the feature to keep default builds warning-free.
+#[cfg(feature = "kernel")]
+use std::net::Ipv4Addr;
+
 use sha2::{Digest, Sha256};
 
 use anyhow::{Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use log::{debug, error, info};
 use tokio::{net::UdpSocket, spawn, sync::RwLock};
+
+#[cfg(feature = "kernel")]
+mod kernel;
 
 const MAX_UDP_SIZE: usize = u16::MAX as usize;
 // Largest possible UDP payload: 65535 bytes - 20 (IP header) - 8 (UDP header).
@@ -38,8 +46,12 @@ enum Commands {
 
 #[derive(Args)]
 struct ForwarderArgs {
+    /// Local listen address.
+    /// Required for the server, and for the client when running the userspace
+    /// proxy (the WireGuard endpoint points here). Unused in kernel mode
+    /// (client with `--kernel`), where the transform runs on the wire.
     #[arg(long, short)]
-    listen: SocketAddrV4,
+    listen: Option<SocketAddrV4>,
 
     #[arg(long, short)]
     forward: String,
@@ -49,6 +61,16 @@ struct ForwarderArgs {
 
     #[arg(long, default_value_t = 180)]
     timeout: u64,
+
+    /// Use kernel eBPF mode instead of the userspace proxy.
+    /// Requires Linux and the `kernel` feature.
+    #[arg(long, default_value_t = false)]
+    kernel: bool,
+
+    /// Network interface to attach eBPF programs to.
+    /// Only used in kernel mode; auto-detected if omitted.
+    #[arg(long)]
+    iface: Option<String>,
 }
 
 #[inline]
@@ -235,8 +257,72 @@ fn get_cpus_num() -> usize {
     num_cpus::get()
 }
 
+/// Dispatch to kernel or userspace mode based on `--kernel`.
+async fn run_dispatch(args: ForwarderArgs, is_client: bool) -> Result<()> {
+    if args.kernel {
+        // Kernel mode: the client binds nothing locally -- `--listen` is not
+        // needed (the interface is picked from the route to the peer, and the
+        // peer's ports come from `--forward`). The server still needs the
+        // mangler port, which `--listen` carries.
+        if !is_client && args.listen.is_none() {
+            bail!("server mode requires --listen (the public mangler port)");
+        }
+        run_kernel(args, is_client).await
+    } else {
+        if args.listen.is_none() {
+            bail!(
+                "userspace mode requires --listen (the local port WireGuard \
+                 points at); omit it only with --kernel"
+            );
+        }
+        run_forwarder(args, is_client).await
+    }
+}
+
+/// Kernel eBPF mode: load XDP/TC programs and let the kernel do the transform.
+#[cfg(feature = "kernel")]
+async fn run_kernel(args: ForwarderArgs, is_client: bool) -> Result<()> {
+    let forward_addr = tokio::net::lookup_host(&args.forward)
+        .await?
+        .next()
+        .ok_or_else(|| anyhow!("invalid forward address"))?;
+
+    let forward_v4 = match forward_addr {
+        SocketAddr::V4(v4) => v4,
+        _ => bail!("forward address must be IPv4"),
+    };
+
+    let listen = args.listen.unwrap_or_else(|| {
+        // Client in kernel mode: unused (no local bind, interface is picked
+        // from the route to the peer). Provide a placeholder.
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)
+    });
+    kernel::run_kernel_ebpf(
+        listen,
+        forward_v4,
+        &args.key,
+        is_client,
+        args.iface.as_deref(),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Kernel eBPF mode stub (non-Linux / feature disabled).
+#[cfg(not(feature = "kernel"))]
+async fn run_kernel(args: ForwarderArgs, _is_client: bool) -> Result<()> {
+    let _ = args; // suppress unused warning
+    bail!(
+        "kernel eBPF mode requires the `kernel` feature and Linux.\n\
+         Rebuild with: cargo build --features kernel --release\n\
+         Or omit --kernel to use the standard userspace proxy."
+    );
+}
+
 async fn run_forwarder(args: ForwarderArgs, is_client: bool) -> Result<()> {
-    info!("Listening on: {}", args.listen);
+    let listen = args.listen.expect("listen checked by run_dispatch");
+    info!("Listening on: {listen}");
 
     let key = Key::new(
         bs58::decode(args.key.as_bytes())
@@ -259,7 +345,7 @@ async fn run_forwarder(args: ForwarderArgs, is_client: bool) -> Result<()> {
     for _ in 0..get_cpus_num() {
         let key = key.clone();
         tokio::spawn(async move {
-            let listen_socket = match new_reuseport_udp_socket(args.listen) {
+            let listen_socket = match new_reuseport_udp_socket(listen) {
                 Ok(v) => v,
                 Err(e) => {
                     error!("can not create the listen_socket: {e}");
@@ -385,8 +471,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::GenerateKey => generate_key(),
-        Commands::Server(args) => run_forwarder(args, false).await,
-        Commands::Client(args) => run_forwarder(args, true).await,
+        Commands::Server(args) => run_dispatch(args, false).await,
+        Commands::Client(args) => run_dispatch(args, true).await,
     }
 }
 
@@ -533,6 +619,483 @@ mod tests {
         let decoded = obfuscate(&mut buf[..], encoded, &key, false).unwrap();
         assert_eq!(decoded, 148);
         assert_eq!(buf[..148], original[..148]);
+    }
+
+    // Verifying the kernel checksum math─────────────────
+    // RFC/BE word space: the kernel sums network-order 16-bit words
+    // (verified against real captures; the earlier LE-halfword model was off
+    // by a byte swap and every packet was dropped by the receiving kernel).
+    // The trimmed path recomputes from scratch and never trusts the on-wire
+    // checksum field -- the key to working over CHECKSUM_PARTIAL offload
+    // paths (veth: the field only holds the pseudo-header sum).
+
+    fn be_sum(bytes: &[u8]) -> u32 {
+        let mut s = 0u32;
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            s += ((bytes[i] as u32) << 8) | bytes[i + 1] as u32;
+            i += 2;
+        }
+        if i < bytes.len() {
+            s += (bytes[i] as u32) << 8;
+        }
+        s
+    }
+
+    fn fold16(s: u32) -> u32 {
+        let s = (s & 0xffff) + (s >> 16);
+        (s & 0xffff) + (s >> 16)
+    }
+
+    fn udp_checksum(pseudo: &[u8], udp: &[u8], payload: &[u8]) -> u16 {
+        let mut d = Vec::with_capacity(pseudo.len() + udp.len() + payload.len());
+        d.extend_from_slice(pseudo);
+        d.extend_from_slice(udp);
+        d.extend_from_slice(payload);
+        let sum = fold16(be_sum(&d));
+        (0xffff - sum) as u16
+    }
+
+    /// The field value of the kernel's CHECKSUM_PARTIAL state:
+    /// fold(Σ_pseudo), uncomplemented (verified against real captures:
+    /// field == fold16 of the pseudo-header BE word sum).
+    /// The pseudo-header only holds src/dst/proto/ulen; port rewrites do
+    /// not affect it.
+    fn partial_pseudo(src: [u8; 4], dst: [u8; 4], ulen: u16) -> u16 {
+        let mut pseudo = Vec::new();
+        pseudo.extend_from_slice(&src);
+        pseudo.extend_from_slice(&dst);
+        pseudo.push(0);
+        pseudo.push(17);
+        pseudo.extend_from_slice(&ulen.to_be_bytes());
+        fold16(be_sum(&pseudo)) as u16
+    }
+
+    fn csum_add(field: u16, delta: u32) -> u16 {
+        let c = ((!field as u32) & 0xffff) + (delta & 0xffff) + ((delta >> 16) & 0xffff);
+        let c = (c & 0xffff) + (c >> 16);
+        !c as u16
+    }
+
+    #[test]
+    fn decode_trim_recomputes_checksum_fresh() {
+        // The trimmed path never reads the on-wire checksum field: it
+        // recomputes over the final bytes. So whether the field holds a full
+        // checksum, the CHECKSUM_PARTIAL pseudo-header sum, or even garbage,
+        // the result must be identical and equal to a fresh computation over
+        // the trimmed packet.
+        let key = Key::new([0x42u8; 32]);
+        let src = [203, 0, 113, 9];
+        let dst = [10, 0, 0, 1];
+        let mangler_port = 10950u16;
+        let wg_port = 54560u16;
+        let mut seed = 0x9e3779b9u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed
+        };
+        for _ in 0..3000 {
+            let msg_type = 1 + (rnd() % 3) as u8;
+            let size = match msg_type {
+                1 => 148usize,
+                2 => 92,
+                _ => 64,
+            };
+            // Real encode (random pad 0..=63); if there is no pad, append
+            // one byte manually (decode only keeps [..size]; pad bytes are
+            // irrelevant).
+            let (mut buf, _original) = test_packet(msg_type, size);
+            let mut encoded = obfuscate(&mut buf[..], size, &key, true).unwrap();
+            if encoded == size {
+                buf[size] = 0x5a;
+                encoded += 1;
+            }
+            let sport = 51820u16;
+            let ulen = (8 + encoded) as u16;
+            let full_check = wire_checksum(src, dst, sport, mangler_port, ulen, &buf[..encoded]);
+            let partial_check = partial_pseudo(src, dst, ulen);
+            let garbage = 1 + (rnd() % 0xfffe) as u16;
+            for check in [full_check, partial_check, garbage] {
+                let (out, new_check, new_dport) = ebpf_decode_mirror(
+                    &buf[..encoded], &key, true, mangler_port, wg_port,
+                    src, dst, sport, mangler_port, ulen, check,
+                );
+                assert_eq!(out.len(), size, "pad={} check={check:04x}", encoded - size);
+                assert_eq!(new_dport, wg_port);
+                let expect =
+                    wire_checksum(src, dst, sport, wg_port, (size + 8) as u16, &out[..size]);
+                assert_eq!(new_check, expect, "pad={} check={check:04x}", encoded - size);
+            }
+        }
+    }
+
+    #[test]
+    fn decode_incremental_matches_fresh() {
+        // Untrimmed path (only type 4 and the pad>64 anomaly): the
+        // incremental update (csum_diff + port delta) must equal a fresh
+        // computation over the final bytes -- requires the on-wire field to
+        // be a full checksum (real-NIC scenario).
+        let key = Key::new([0x42u8; 32]);
+        let src = [203, 0, 113, 9];
+        let dst = [10, 0, 0, 1];
+        let mangler_port = 10950u16;
+        let wg_port = 54560u16;
+        let mut seed = 0xdeadbeefu32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed
+        };
+        for _ in 0..3000 {
+            let is_server = rnd() & 1 == 0;
+            // type 4: length may exceed 16 (carries data)
+            let (mut buf, _original) = test_packet(4, 16 + (rnd() % 60) as usize);
+            let wire_len = obfuscate(&mut buf[..], 16 + (rnd() % 60) as usize, &key, true).unwrap();
+            let sport = 51820u16;
+            let ulen = (8 + wire_len) as u16;
+            let check = wire_checksum(src, dst, sport, mangler_port, ulen, &buf[..wire_len]);
+            if check == 0 {
+                continue; // 0 = no checksum; the mirror keeps 0 (same as eBPF)
+            }
+            let (out, new_check, _) = ebpf_decode_mirror(
+                &buf[..wire_len], &key, is_server, mangler_port, wg_port,
+                src, dst, sport, mangler_port, ulen, check,
+            );
+            assert_eq!(out.len(), wire_len);
+            let nd = if is_server { wg_port } else { mangler_port };
+            let expect = wire_checksum(src, dst, sport, nd, ulen, &out);
+            assert_eq!(new_check, expect, "wire={wire_len} is_server={is_server}");
+        }
+    }
+
+    #[test]
+    fn encode_partial_keeps_pseudo_field_complete_updates_delta() {
+        // Encode: under CHECKSUM_PARTIAL the field is fold(Σ_pseudo) and
+        // unaffected by the transform (the pseudo-header only holds
+        // src/dst/proto/ulen); with a full checksum the incremental update
+        // must equal a fresh computation. Also check that a PARTIAL input
+        // keeps the field at fold(Σ_pseudo).
+        let key = Key::new([0x42u8; 32]);
+        let src = [203, 0, 113, 9];
+        let dst = [10, 0, 0, 1];
+        let mangler_port = 10950u16;
+        let wg_port = 54560u16;
+        let mut seed = 0x12345a11u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed
+        };
+        for _ in 0..3000 {
+            let msg_type = 1 + (rnd() % 4) as u8;
+            let size = match msg_type {
+                1 => 148usize,
+                2 => 92,
+                3 => 64,
+                _ => 40,
+            };
+            let (buf, _original) = test_packet(msg_type, size);
+            let sport = wg_port;
+            let dport = 51820u16;
+            let ulen = (8 + size) as u16;
+            let is_server = rnd() & 1 == 0;
+
+            let full_check = wire_checksum(src, dst, sport, dport, ulen, &buf[..size]);
+            let partial_check = partial_pseudo(src, dst, ulen);
+
+            // COMPLETE input: the incremental update must equal a fresh computation
+            let (mangled, enc_check, new_sport) = ebpf_encode_mirror(
+                &buf[..size], &key, is_server, mangler_port, wg_port,
+                src, dst, sport, dport, ulen, full_check, &mut rnd,
+            );
+            let ns = if is_server { mangler_port } else { sport };
+            assert_eq!(new_sport, ns);
+            let expect = wire_checksum(src, dst, ns, dport, ulen, &mangled);
+            assert_eq!(enc_check, expect, "type={msg_type} is_server={is_server}");
+
+            // PARTIAL input: the field stays at fold(Σ_pseudo) -- the
+            // device completes the payload part over the final bytes, and
+            // the result matches a fresh computation (completion invariant).
+            let (_mangled2, p_check, new_sport2) = ebpf_encode_mirror(
+                &buf[..size], &key, is_server, mangler_port, wg_port,
+                src, dst, sport, dport, ulen, partial_check, &mut rnd,
+            );
+            assert_eq!(p_check, partial_pseudo(src, dst, ulen), "type={msg_type}");
+            // The PARTIAL branch leaves the field exactly as the kernel's
+            // own send path would write it for this packet (pseudo-header
+            // unchanged), so the device completes the mangled packet exactly
+            // like a normal one -- correctness by construction, no need to
+            // model the device formula.
+            let ns2 = if is_server { mangler_port } else { sport };
+            assert_eq!(new_sport2, ns2);
+        }
+    }
+
+    // kernel/userspace interop: on-wire bytes + checksums
+    //
+    // The two mirrors below strictly replicate the eBPF try_decode /
+    // try_encode transform logic (header restore/randomize + body XOR
+    // key[(i-4)%8] + port rewrite + trim + fresh recompute/incremental/
+    // CHECKSUM_PARTIAL keep). Together with the userspace obfuscate they
+    // must restore the original messages in both directions, and the
+    // checksums must equal a fresh computation over the final bytes (the
+    // trimmed path recomputes, never trusting the on-wire field) -- that is
+    // exactly what on-wire interop requires.
+
+    /// Delta for a 2-byte BE field: plain (new - old) mod 65535 in the
+    /// RFC/BE sum space (no byte swap).
+    fn word_delta_test(old: u16, new: u16) -> u32 {
+        let d = (new as i32) - (old as i32);
+        if d < 0 {
+            (d + 65535) as u32
+        } else {
+            d as u32
+        }
+    }
+
+    /// Semantics of bpf_csum_diff(from=pre, to=post): Σpost - Σpre
+    /// (mod 65535, BE space -- the kernel's csum_partial and the field
+    /// share the same space).
+    fn csum_delta_test(pre: &[u8], post: &[u8]) -> u32 {
+        let fs = fold16(be_sum(pre));
+        let ts = fold16(be_sum(post));
+        (ts + 0xffff - fs) % 65535
+    }
+
+    /// Same as the eBPF try_decode: returns (restored bytes, new checksum,
+    /// new dport). The input payload is the on-wire (mangled) bytes;
+    /// `sport/dport/ulen/check` are the on-wire UDP header values;
+    /// `is_server` controls the port rewrite 10950->54560.
+    /// Trimmed path: fresh recompute (on-wire field ignored); untrimmed/data:
+    /// incremental update.
+    #[allow(clippy::too_many_arguments)]
+    fn ebpf_decode_mirror(
+        payload: &[u8],
+        key: &Key,
+        is_server: bool,
+        mangler_port: u16,
+        wg_port: u16,
+        src: [u8; 4],
+        dst: [u8; 4],
+        sport: u16,
+        dport: u16,
+        ulen: u16,
+        check: u16,
+    ) -> (Vec<u8>, u16, u16) {
+        let kbidx = payload[2];
+        let used_key = key.get(&payload[..2]).unwrap();
+        let msg_type = payload[3] ^ Key::get_key_byte(used_key, kbidx);
+        let (size, chg_end) = match msg_type {
+            4 => (0, 16),
+            1 => (148, 148),
+            2 => (92, 92),
+            3 => (64, 64),
+            _ => return (payload.to_vec(), check, dport),
+        };
+        let sn = chg_end;
+        let mut pre = vec![0u8; sn];
+        pre.copy_from_slice(&payload[..sn]);
+        let mut post = pre.clone();
+        post[0] = msg_type;
+        post[1..4].fill(0);
+        for i in 4..sn {
+            post[i] ^= used_key[(i - 4) % 8];
+        }
+        let wire_len = payload.len();
+        let mut trimmed = wire_len;
+        let mut new_ulen = ulen;
+        if msg_type != 4 && wire_len != size {
+            let pad = wire_len - size;
+            if pad <= 64 {
+                new_ulen = (size + 8) as u16;
+                trimmed = size;
+            }
+        }
+        let new_dport = if is_server { wg_port } else { dport };
+        let new_check = if check != 0 {
+            if trimmed != wire_len {
+                // fresh: pseudo-header + UDP header (new ulen/dport) + restored body
+                let mut pseudo = Vec::new();
+                pseudo.extend_from_slice(&src);
+                pseudo.extend_from_slice(&dst);
+                pseudo.push(0);
+                pseudo.push(17);
+                pseudo.extend_from_slice(&new_ulen.to_be_bytes());
+                let mut udp = Vec::new();
+                udp.extend_from_slice(&sport.to_be_bytes());
+                udp.extend_from_slice(&new_dport.to_be_bytes());
+                udp.extend_from_slice(&new_ulen.to_be_bytes());
+                udp.extend_from_slice(&[0, 0]);
+                udp_checksum(&pseudo, &udp, &post)
+            } else {
+                let mut delta = csum_delta_test(&pre, &post);
+                if is_server {
+                    delta += word_delta_test(mangler_port, wg_port);
+                }
+                csum_add(check, delta)
+            }
+        } else {
+            0
+        };
+        let mut out = payload.to_vec();
+        out[..sn].copy_from_slice(&post);
+        out.truncate(trimmed); // eBPF: bpf_xdp_adjust_tail trims the padding
+        (out, new_check, new_dport)
+    }
+
+    /// Same as the eBPF try_encode: returns (mangled bytes, new checksum,
+    /// new sport). When `is_server`, the source port is rewritten
+    /// wg_port -> mangler_port. Under CHECKSUM_PARTIAL (field ==
+    /// fold(Σ_pseudo)) the field is left unchanged -- the device completes
+    /// the payload over the final bytes; with a full checksum, incremental.
+    #[allow(clippy::too_many_arguments)]
+    fn ebpf_encode_mirror(
+        payload: &[u8],
+        key: &Key,
+        is_server: bool,
+        mangler_port: u16,
+        wg_port: u16,
+        src: [u8; 4],
+        dst: [u8; 4],
+        sport: u16,
+        _dport: u16,
+        ulen: u16,
+        check: u16,
+        mut rnd: impl FnMut() -> u32,
+    ) -> (Vec<u8>, u16, u16) {
+        let msg_type = payload[0];
+        let sn: usize = match msg_type {
+            4 => 16,
+            1 => 148,
+            2 => 92,
+            3 => 64,
+            _ => panic!("bad type"),
+        };
+        let mut pre = vec![0u8; sn];
+        pre.copy_from_slice(&payload[..sn]);
+        let mut post = pre.clone();
+        let r = rnd();
+        let kidx = (r & 0xffff) as u16;
+        let kbidx = (r >> 16) as u8;
+        let used_key = key.get(&kidx.to_le_bytes()).unwrap();
+        post[0] = (kidx & 0xff) as u8;
+        post[1] = (kidx >> 8) as u8;
+        post[2] = kbidx;
+        post[3] = msg_type ^ Key::get_key_byte(used_key, kbidx);
+        for i in 4..sn {
+            post[i] ^= used_key[(i - 4) % 8];
+        }
+        let new_sport = if is_server { mangler_port } else { sport };
+        let new_check = if check != 0 {
+            if check == partial_pseudo(src, dst, ulen) {
+                // CHECKSUM_PARTIAL: pseudo-header untouched, field kept
+                check
+            } else {
+                let mut delta = csum_delta_test(&pre, &post);
+                if is_server {
+                    delta += word_delta_test(wg_port, mangler_port);
+                }
+                csum_add(check, delta)
+            }
+        } else {
+            0
+        };
+        let mut out = payload.to_vec();
+        out[..sn].copy_from_slice(&post);
+        (out, new_check, new_sport)
+    }
+
+    /// Assemble the IP/UDP header (pseudo-header + UDP header + payload)
+    /// and return the full checksum
+    fn wire_checksum(
+        src: [u8; 4],
+        dst: [u8; 4],
+        sport: u16,
+        dport: u16,
+        ulen: u16,
+        payload: &[u8],
+    ) -> u16 {
+        let mut pseudo = Vec::new();
+        pseudo.extend_from_slice(&src);
+        pseudo.extend_from_slice(&dst);
+        pseudo.push(0);
+        pseudo.push(17);
+        pseudo.extend_from_slice(&ulen.to_be_bytes());
+        let mut udp = Vec::new();
+        udp.extend_from_slice(&sport.to_be_bytes());
+        udp.extend_from_slice(&dport.to_be_bytes());
+        udp.extend_from_slice(&ulen.to_be_bytes());
+        udp.extend_from_slice(&[0, 0]);
+        udp_checksum(&pseudo, &udp, payload)
+    }
+
+    #[test]
+    fn kernel_userspace_interop_round_trip() {
+        let key = Key::new([0x42u8; 32]);
+        let src = [203, 0, 113, 9]; // peer public IP
+        let dst = [10, 0, 0, 1]; // local IP
+        let mangler_port = 10950u16;
+        let wg_port = 54560u16;
+        let mut seed = 0x1234abcdu32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed
+        };
+
+        for (msg_type, size) in [(1u8, 148usize), (2, 92), (3, 64), (4, 40)] {
+            let (mut buf, original) = test_packet(msg_type, size);
+
+            // Direction 1: userspace encode -> kernel decode (server)
+            let encoded = obfuscate(&mut buf[..], size, &key, true).unwrap();
+            let wire_ulen = (8 + encoded) as u16;
+            let wire_check = wire_checksum(src, dst, 51820, mangler_port, wire_ulen, &buf[..encoded]);
+            let (decoded, new_check, new_dport) = ebpf_decode_mirror(
+                &buf[..encoded], &key, true, mangler_port, wg_port, src, dst,
+                51820, mangler_port, wire_ulen, wire_check,
+            );
+            assert_eq!(decoded.len(), size, "type {msg_type}");
+            assert_eq!(&decoded[..size], &original[..size], "type {msg_type} bytes");
+            let expect_check = wire_checksum(src, dst, 51820, wg_port, (size + 8) as u16, &decoded[..size]);
+            assert_eq!(new_check, expect_check, "type {msg_type} checksum");
+            assert_eq!(new_dport, wg_port);
+
+            // Direction 2: kernel encode (server) -> userspace decode
+            // the WG daemon's original message from wg_port -> TC encode + sport rewrite
+            let (mangled, enc_check, new_sport) = ebpf_encode_mirror(
+                &original[..size], &key, true, mangler_port, wg_port, src, dst,
+                wg_port, 51820, (size + 8) as u16,
+                wire_checksum(src, dst, wg_port, 51820, (size + 8) as u16, &original[..size]),
+                &mut rnd,
+            );
+            assert_eq!(new_sport, mangler_port);
+            // the checksum delta must be correct (fresh over on-wire bytes)
+            let expect_enc = wire_checksum(src, dst, mangler_port, 51820, (size + 8) as u16, &mangled);
+            assert_eq!(enc_check, expect_enc, "type {msg_type} enc checksum");
+            // userspace decode must restore (note: kernel never pads; len unchanged)
+            let mut dec_buf = [0u8; MAX_UDP_SIZE];
+            dec_buf[..mangled.len()].copy_from_slice(&mangled);
+            let decoded = obfuscate(&mut dec_buf[..], mangled.len(), &key, false).unwrap();
+            assert_eq!(decoded, size, "type {msg_type} userspace decoded len");
+            assert_eq!(&dec_buf[..size], &original[..size], "type {msg_type} userspace decoded bytes");
+
+            // Direction 3: kernel encode -> kernel decode (dual-kernel deployment)
+            let (mangled2, enc2, _) = ebpf_encode_mirror(
+                &original[..size], &key, true, mangler_port, wg_port, src, dst,
+                wg_port, 51820, (size + 8) as u16,
+                wire_checksum(src, dst, wg_port, 51820, (size + 8) as u16, &original[..size]),
+                &mut rnd,
+            );
+            let ulen2 = (8 + mangled2.len()) as u16;
+            let check2 = wire_checksum(src, dst, mangler_port, 51820, ulen2, &mangled2);
+            let (decoded2, ncheck2, dport2) = ebpf_decode_mirror(
+                &mangled2, &key, false, mangler_port, wg_port, src, dst,
+                mangler_port, 51820, ulen2, check2,
+            );
+            assert_eq!(decoded2.len(), size, "type {msg_type} kk len");
+            assert_eq!(&decoded2[..size], &original[..size], "type {msg_type} kk bytes");
+            let expect_kk = wire_checksum(src, dst, mangler_port, 51820, (size + 8) as u16, &decoded2[..size]);
+            assert_eq!(ncheck2, expect_kk, "type {msg_type} kk checksum");
+            assert_eq!(dport2, 51820);
+            assert_eq!(enc2, check2); // encoded on-wire checksum matches a fresh computation
+        }
     }
 
     #[test]
