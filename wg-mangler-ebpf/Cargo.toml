@@ -1,0 +1,18 @@
+[package]
+name = "wg-mangler-ebpf"
+version = "0.2.0"
+edition = "2021"
+publish = false
+description = "eBPF programs for wg-mangler kernel mode (XDP decode, TC encode)"
+license = "MIT OR GPL-2.0"
+
+# This crate is only built for the bpfel-unknown-none target (done by aya-build
+# with a nightly toolchain); it needs no other build-deps.
+
+[dependencies]
+aya-ebpf = "0.2.1"
+network-types = "0.2"
+
+[[bin]]
+name = "wg_mangler_ebpf"
+path = "src/main.rs"
