@@ -176,10 +176,18 @@ server:  XDP ingress: dport == 12345  → decode + port rewrite → 51820
 
 Both programs are passive: they only transform matching packets and pass
 everything else through (`XDP_PASS` / `TC_ACT_PIPE`). The checksum fixup is
-fully incremental (verified against kernel `bpf_csum_diff` semantics), so even
-padded handshake packets are trimmed back to their fixed size on the wire.
+fully incremental (computed directly over big-endian halfwords in the same
+RFC/BE space as the checksum field — `bpf_csum_diff` is deliberately avoided
+because its result lives in the kernel's rotated wsum space and is off by a
+fold rotation when added to a BE-space field; this was the root cause of the
+reply-path loss), so even padded handshake packets are trimmed back to their
+fixed size on the wire.
 The on-wire format is byte-identical to the userspace mode, so a kernel-mode
 peer and a userspace peer interoperate freely.
+
+802.1Q / 802.1ad VLAN frames are supported on both hooks (up to two tags,
+i.e. single-level QinQ), so tagging the interface — common on OpenWrt WAN
+setups — does not silently break the transform.
 
 > Note: the eBPF path applies the XOR transform only. WG peer management,
 > sessions and endpoint logic stay in the kernel's WireGuard implementation

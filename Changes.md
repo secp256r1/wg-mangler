@@ -1,3 +1,37 @@
+## 0.2.3 - 2026-08-06
+
+- fix(ebpf): **incremental delta no longer uses `bpf_csum_diff`** -- the
+  helper returns a value in the kernel's *rotated* wsum space (`csum_partial`
+  accumulates native LE dwords; `csum_from32to16` folds without the byte
+  swap `csum_fold` applies), so combining it with `csum_add` (BE-space
+  field math) was wrong by exactly that fold rotation. Real captures
+  (client eth0 ingress, XDP post-decode): decoded payloads showed
+  checksum `0x74c0`/`0xa4b4` where fresh recomputation gives
+  `0xdd57`/`0x94c4` -- every decode-then-deliver packet was dropped by the
+  kernel, killing the reply path. Delta is now computed inline over
+  big-endian halfwords (`ΣBE(to) − ΣBE(from)` mod 65535), the same space
+  the field lives in; verified offline against the captured packets and by
+  3000 randomized unit tests (decode-incremental == fresh recompute).
+
+## 0.2.2 - 2026-08-06
+
+- fix(ebpf): **incremental checksum now folds twice** (`csum_add` in
+  `wg_decode`/`wg_encode` and in the matching userspace mirror). The single
+  fold truncated a folded sum >= 0x10000 instead of wrapping the carry, so
+  the checksum field was off by one for about 1 in 65535 packets on the hot
+  incremental path (every full-checksum data packet on encode, untrimmed
+  decode) — now identical to the kernel's `csum_fold`. A new
+  `csum_add_fuzz_matches_reference_fold` test forces the exact carry
+  boundary, which random tests can never hit reliably.
+- feat(ebpf): **802.1Q / 802.1ad (and single-level QinQ) support on both
+  hooks** — up to two VLAN tags are skipped via the EtherType chain, so
+  VLAN-tagged WireGuard traffic (common on OpenWrt WAN interfaces) is
+  transformed like plain frames instead of silently passing through.
+- fix(ebpf): **`bpf_xdp_adjust_tail` return value is now checked and the
+  trim runs before any mutation** — if the kernel refuses to shrink the
+  packet (e.g. generic XDP on a non-linear skb) the transform bails out
+  untouched instead of leaving a half-mangled packet in the receive path.
+
 ## 0.2.1 - 2026-08-05
 
 - **fix(kernel mode): checksum space corrected -- the LE-halfword incremental
@@ -18,8 +52,14 @@
     fold(Σ_pseudo)) and leaves the field exactly as the kernel's own send path
     would write it (the pseudo-header only holds src/dst/proto/ulen and is
     unaffected by the transform; the device completes the payload over the
-    final bytes); with a full checksum it updates precisely via
-    `bpf_csum_diff` + a plain `(new-old) mod 65535` port delta.
+    final bytes); with a full checksum it updates precisely via a hand-rolled
+    big-endian halfword delta + a plain `(new-old) mod 65535` port delta.
+    (Root-caused fix: `bpf_csum_diff` returns a value in the kernel's rotated
+    wsum space — `csum_partial` accumulates native LE dwords and
+    `csum_from32to16` folds without the byte swap `csum_fold` applies — so
+    adding it to a BE-space field was wrong by the fold rotation. Real
+    captures: helper path wrote 0x74c0 where the true value is 0xdd57; the
+    direct BE-halfword computation reproduces the true value exactly.)
   - untrimmed/data (type 4) decode stays incremental and equals a fresh
     recomputation under full-checksum input (verified by 3000 randomized unit
     tests).
@@ -62,8 +102,8 @@
   Requires Linux and `cargo build --features kernel`.
   - `xdp/wg_decode` - ingress: unmangle + restore WireGuard header + XOR body +
     server-side port rewrite (MG_PORT→WG_PORT) + optional padding trim + checksum
-    fixup (trim path recomputes fresh in RFC/BE space; untrimmed/data use
-    `bpf_csum_diff` deltas — see 0.2.1 notes)
+    fixup (trim path recomputes fresh in RFC/BE space; untrimmed/data use an
+    inline big-endian halfword delta — see 0.2.1 notes)
   - `tc/wg_encode` - egress: random header + XOR body + CHECKSUM_PARTIAL-aware
     checksum handling
   - key derivation identical to userspace mode (SHA-256, 64×8-byte keys, same

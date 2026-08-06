@@ -10,6 +10,10 @@
 //!   WG_PORT → MG_PORT, so the on-wire 4-tuple matches the userspace proxy)
 //!   and fix the UDP checksum.
 //!
+//! Both hooks understand 802.1Q / 802.1ad (and single-level QinQ): up to two
+//! VLAN tags are skipped, so VLAN-tagged WG traffic (common on OpenWrt WAN
+//! interfaces) is transformed just like plain frames.
+//!
 //! The wire format is byte-identical to the userspace proxy (see the README),
 //! so mixed kernel/userspace deployments interoperate: decode accepts and
 //! trims the optional random padding that userspace peers add. The body-XOR
@@ -30,11 +34,18 @@
 //!   the pseudo-header sum) work.
 //! * Decode, untrimmed handshake / data messages: only the first
 //!   16..=148 bytes change, so the checksum is updated incrementally with
-//!   `bpf_csum_diff` (the kernel's own sum space) plus a plain word delta
-//!   for the port rewrite. Exact when the received field is a full checksum
-//!   (real NICs); on offload paths the field is only the pseudo-sum and
-//!   these two rare paths stay untouched (they are not produced by our own
+//!   a hand-rolled big-endian halfword delta (the RFC/BE sum space the
+//!   field lives in) plus a plain word delta for the port rewrite. Exact
+//!   when the received field is a full checksum (real NICs); on offload
+//!   paths the field is only the pseudo-sum and these two rare paths stay
+//!   untouched (they are not produced by our own
 //!   encode, which never pads and trims what it can).
+//!   `bpf_csum_diff` is *not* used: its result lives in the kernel's
+//!   rotated wsum space (`csum_partial` accumulates native dwords,
+//!   `csum_from32to16` folds without `csum_fold`'s byte swap), so adding it
+//!   to a BE-space field is off by the fold rotation — verified against
+//!   real captures where the helper wrote 0x74c0 but the true value is
+//!   0xdd57.
 //! * Encode: the egress skb is `CHECKSUM_PARTIAL` when TX offload is on —
 //!   the kernel writes the *uncomplemented* pseudo-header sum into the
 //!   field and the device completes the payload part. We detect that state
@@ -42,7 +53,9 @@
 //!   dst, proto, ulen) is never changed by the transform, the field is left
 //!   exactly as the kernel's own send path would write it and the device
 //!   completes it correctly. When the field is a full checksum (offload
-//!   off), the incremental update is applied.
+//!   off), an incremental update is applied — folded twice like the
+//!   kernel's own `csum_fold`, so a carry-out of the first fold is wrapped
+//!   back instead of truncated.
 
 #![no_std]
 #![no_main]
@@ -50,7 +63,7 @@
 use aya_ebpf::{
     bindings::{TC_ACT_PIPE, xdp_action},
     helpers::generated::{
-        bpf_csum_diff, bpf_get_prandom_u32, bpf_skb_load_bytes, bpf_xdp_adjust_tail,
+        bpf_get_prandom_u32, bpf_skb_load_bytes, bpf_xdp_adjust_tail,
     },
     macros::{classifier, map, xdp},
     maps::Array,
@@ -61,7 +74,12 @@ use network_types::{
     eth::{EthHdr, EtherType},
     ip::{IpProto, Ipv4Hdr},
     udp::UdpHdr,
+    vlan::VlanHdr,
 };
+
+/// Maximum number of 802.1Q/802.1ad tags to skip (single tag, or two in
+/// QinQ deployments). Deeper nesting is passed through untransformed.
+const MAX_VLAN_TAGS: usize = 2;
 
 /// Snapshot size: >= the largest changed region (148-byte handshake init).
 const SNAP: usize = 160;
@@ -185,26 +203,66 @@ fn ip_checksum(
 
 /// Incremental one's-complement checksum update:
 /// `field' = ~((~field) + delta)` with mod-65535 folding (delta is the
-/// kernel sum-space delta, may exceed 16 bits).
+/// kernel sum-space delta, may exceed 16 bits). The fold runs twice, like
+/// the kernel's `csum_fold`: the first pass folds the 32-bit sum down to
+/// ~16 bits, the second absorbs the carry-out of the first. Without it a
+/// sum landing on exactly 0x1FFFF (or any folded value >= 0x10000) is
+/// truncated instead of wrapped and the resulting field is off by one.
 #[inline(always)]
 fn csum_add(field: u16, delta: u32) -> u16 {
     let c = ((!field as u32) & 0xffff) + (delta & 0xffff) + ((delta >> 16) & 0xffff);
     let c = (c & 0xffff) + (c >> 16);
+    let c = (c & 0xffff) + (c >> 16);
     !c as u16
 }
 
-/// Sum-space delta between two 4-byte-aligned regions via `bpf_csum_diff`
-/// (the kernel's own `csum_partial`, same RFC/BE space as the field).
+/// Sum-space delta between two regions: `fold16(Σ BE16(to)) − fold16(Σ BE16(from))`
+/// computed directly over big-endian halfwords (RFC space, same as the UDP
+/// checksum field).
+///
+/// `bpf_csum_diff` is deliberately NOT used: its return value lives in the
+/// kernel's rotated csum space (`csum_partial` accumulates native LE dwords
+/// and `csum_from32to16` folds without the byte swap that `csum_fold`
+/// applies), so adding it to a BE-space field via `csum_add` is off by the
+/// fold rotation. Verified on real packets: the helper path wrote 0x74c0
+/// where the true value is 0xdd57; the manual BE model reproduces the
+/// true value exactly.
 #[inline(always)]
 fn csum_delta(from: *const u8, from_len: u32, to: *const u8, to_len: u32) -> Result<u32, ()> {
-    if from_len == 0 && to_len == 0 {
-        return Ok(0);
+    // Both regions are the same length in every call site; guard anyway.
+    let n = (from_len.min(to_len) as usize).min(SNAP) & !1;
+    let mut sf: u32 = 0;
+    let mut st: u32 = 0;
+    let mut i: usize = 0;
+    // Fixed upper bound so the verifier can prove the packet/stack reads
+    // are in bounds; `i < n` only decides whether to accumulate.
+    while i < SNAP {
+        let f0 = unsafe { *from.add(i) } as u32;
+        let f1 = unsafe { *from.add(i + 1) } as u32;
+        let t0 = unsafe { *to.add(i) } as u32;
+        let t1 = unsafe { *to.add(i + 1) } as u32;
+        if i + 1 < n {
+            sf += (f0 << 8) | f1;
+            st += (t0 << 8) | t1;
+        } else if i < n {
+            // Odd tail byte counts as a single BE halfword.
+            sf += f0 << 8;
+            st += t0 << 8;
+        }
+        i += 2;
     }
-    let ret = unsafe { bpf_csum_diff(from as *mut u32, from_len, to as *mut u32, to_len, 0) };
-    if ret < 0 {
-        return Err(());
+    // Fold 32-bit sums to 16 bits; max 74 words * 0xffff < 2^31, so one
+    // conditional wrap after the first fold suffices.
+    let fs = (sf & 0xffff) + (sf >> 16);
+    let fs = if fs >= 65535 { fs - 65535 } else { fs };
+    let ft = (st & 0xffff) + (st >> 16);
+    let ft = if ft >= 65535 { ft - 65535 } else { ft };
+    // delta = fold(to) - fold(from) mod 65535
+    let mut d = ft + 65535 - fs;
+    if d >= 65535 {
+        d -= 65535;
     }
-    Ok(ret as u32)
+    Ok(d)
 }
 
 /// Delta for replacing a 2-byte big-endian field value (port), plain
@@ -243,13 +301,31 @@ unsafe fn ptr_at_mut<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, ()> {
     Ok((start + offset) as *mut T)
 }
 
+/// Returns `(ip, udp, l3_off)`: the IPv4 and UDP headers plus the offset of
+/// the IPv4 header inside the frame. 802.1Q/802.1ad (and QinQ) tags are
+/// skipped via the EtherType chain, so VLAN-tagged WireGuard traffic is
+/// transformed like any other frame.
 #[inline(always)]
-unsafe fn parse_udp(ctx: &XdpContext) -> Result<(*const Ipv4Hdr, *const UdpHdr), ()> {
+unsafe fn parse_udp(ctx: &XdpContext) -> Result<(*const Ipv4Hdr, *const UdpHdr, usize), ()> {
     let eth = ptr_at::<EthHdr>(ctx, 0)?;
-    if (*eth).ether_type != EtherType::Ipv4 as u16 {
+    let mut etype = (*eth).ether_type;
+    let mut l3_off = EthHdr::LEN;
+    for _ in 0..MAX_VLAN_TAGS {
+        let is_vlan = etype == EtherType::Ieee8021q as u16
+            || etype == EtherType::Ieee8021ad as u16
+            || etype == EtherType::Ieee8021QinQ1 as u16
+            || etype == EtherType::Ieee8021QinQ2 as u16;
+        if !is_vlan {
+            break;
+        }
+        let vlan = ptr_at::<VlanHdr>(ctx, l3_off)?;
+        etype = (*vlan).ether_type;
+        l3_off += VlanHdr::LEN;
+    }
+    if etype != EtherType::Ipv4 as u16 {
         return Err(());
     }
-    let ip = ptr_at::<Ipv4Hdr>(ctx, EthHdr::LEN)?;
+    let ip = ptr_at::<Ipv4Hdr>(ctx, l3_off)?;
     if (*ip).proto != IpProto::Udp as u8 {
         return Err(());
     }
@@ -259,8 +335,8 @@ unsafe fn parse_udp(ctx: &XdpContext) -> Result<(*const Ipv4Hdr, *const UdpHdr),
     if u16::from_be_bytes((*ip).frags) & 0x1fff != 0 {
         return Err(());
     }
-    let udp = ptr_at::<UdpHdr>(ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
-    Ok((ip, udp))
+    let udp = ptr_at::<UdpHdr>(ctx, l3_off + Ipv4Hdr::LEN)?;
+    Ok((ip, udp, l3_off))
 }
 
 #[xdp]
@@ -272,7 +348,7 @@ pub fn wg_decode(ctx: XdpContext) -> u32 {
 }
 
 unsafe fn try_decode(ctx: &XdpContext) -> Result<u32, ()> {
-    let (ip, udp) = parse_udp(ctx)?;
+    let (ip, udp, l3_off) = parse_udp(ctx)?;
 
     let mangler_port = (cfg(0) & 0xffff) as u16;
     let wg_port = (cfg(1) & 0xffff) as u16;
@@ -377,8 +453,30 @@ unsafe fn try_decode(ctx: &XdpContext) -> Result<u32, ()> {
         }
     }
 
-    // Actually mutate: restore header + XOR body
-    let udp_mut = ptr_at_mut::<UdpHdr>(ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
+    // Trim the padding *before* any mutation: if `bpf_xdp_adjust_tail`
+    // fails (e.g. generic XDP on a non-linear/GRO skb) the packet must be
+    // left exactly as it arrived, so bail out of the whole transform here.
+    if trim_len != 0 {
+        let shrink = (size as i64 - wire_len as i64) as i32;
+        if unsafe { bpf_xdp_adjust_tail(ctx.ctx, shrink) } != 0 {
+            return Ok(xdp_action::XDP_PASS);
+        }
+    }
+
+    // Re-derive packet pointers *after* adjust_tail: the helper changes
+    // data_end, so the old `payload` pointer is stale. It also must not be
+    // reused because its `as usize` form (used for `wire_len` above) may be
+    // spilled to the same stack slot as the pointer; reloading it after the
+    // helper call comes back as an inttoptr'd scalar and the verifier
+    // rejects the packet write ("R1 invalid mem access 'scalar'").
+    let udp_mut = ptr_at_mut::<UdpHdr>(ctx, l3_off + Ipv4Hdr::LEN)?;
+    let payload = (udp_mut as *const u8).add(UdpHdr::LEN) as *mut u8;
+    // Re-establish the mutation-region bounds against the (possibly
+    // shortened) data_end; for handshake messages chg_end == size, so the
+    // trimmed packet satisfies this exactly.
+    if (payload as *const u8).add(chg_end as usize) > ctx.data_end() as *const u8 {
+        return Ok(xdp_action::XDP_PASS);
+    }
     core::ptr::copy_nonoverlapping(post.as_ptr(), payload, sn);
     if old_check != 0 {
         (*udp_mut).check = new_check.to_be_bytes();
@@ -387,9 +485,10 @@ unsafe fn try_decode(ctx: &XdpContext) -> Result<u32, ()> {
         (*udp_mut).dst = wg_port.to_be_bytes();
     }
 
-    // Trim padding + recompute the IP header checksum
+    // Recompute the IP header checksum for the trimmed packet (the UDP len
+    // field and the IP total length shrink by `trim_len`)
     if trim_len != 0 {
-        let ip_mut = ptr_at_mut::<Ipv4Hdr>(ctx, EthHdr::LEN)?;
+        let ip_mut = ptr_at_mut::<Ipv4Hdr>(ctx, l3_off)?;
         let ihl = ((*ip_mut).vihl & 0x0f) as u16;
         let new_tlen = ihl * 4 + 8 + size as u16;
         (*udp_mut).len = new_ulen.to_be_bytes();
@@ -406,10 +505,6 @@ unsafe fn try_decode(ctx: &XdpContext) -> Result<u32, ()> {
             (*ip_mut).dst_addr,
         )
         .to_be_bytes();
-        let shrink = (size as i64 - wire_len as i64) as i32;
-        unsafe {
-            bpf_xdp_adjust_tail(ctx.ctx, shrink);
-        }
     }
 
     Ok(xdp_action::XDP_PASS)
@@ -427,10 +522,36 @@ pub fn wg_encode(ctx: TcContext) -> i32 {
 
 unsafe fn try_encode(ctx: &TcContext) -> Result<i32, ()> {
     let eth: EthHdr = ctx.load(0).map_err(|_| ())?;
-    if eth.ether_type != EtherType::Ipv4 as u16 {
+    let mut etype = eth.ether_type;
+    let mut l3_off = EthHdr::LEN;
+    // 802.1Q / 802.1ad (and QinQ) tags: skip up to MAX_VLAN_TAGS levels so
+    // VLAN-tagged WireGuard traffic is mangled like untagged frames.
+    // NOTE: do not turn this into a rolled loop over the variable `l3_off`
+    // -- the BPF backend then emits `ptr <<= 16` on the context pointer
+    // ("pointer arithmetic with <<= operator prohibited"). Peel the tag
+    // slots at constant offsets instead.
+    let v1: VlanHdr = ctx.load(l3_off).map_err(|_| ())?;
+    let v1_vlan = etype == EtherType::Ieee8021q as u16
+        || etype == EtherType::Ieee8021ad as u16
+        || etype == EtherType::Ieee8021QinQ1 as u16
+        || etype == EtherType::Ieee8021QinQ2 as u16;
+    if v1_vlan {
+        etype = v1.ether_type;
+        l3_off += VlanHdr::LEN;
+        let v2: VlanHdr = ctx.load(l3_off).map_err(|_| ())?;
+        let v2_vlan = etype == EtherType::Ieee8021q as u16
+            || etype == EtherType::Ieee8021ad as u16
+            || etype == EtherType::Ieee8021QinQ1 as u16
+            || etype == EtherType::Ieee8021QinQ2 as u16;
+        if v2_vlan {
+            etype = v2.ether_type;
+            l3_off += VlanHdr::LEN;
+        }
+    }
+    if etype != EtherType::Ipv4 as u16 {
         return Ok(TC_ACT_PIPE);
     }
-    let ip: Ipv4Hdr = ctx.load(EthHdr::LEN).map_err(|_| ())?;
+    let ip: Ipv4Hdr = ctx.load(l3_off).map_err(|_| ())?;
     if ip.proto != IpProto::Udp as u8 {
         return Ok(TC_ACT_PIPE);
     }
@@ -438,7 +559,7 @@ unsafe fn try_encode(ctx: &TcContext) -> Result<i32, ()> {
     if u16::from_be_bytes(ip.frags) & 0x1fff != 0 {
         return Ok(TC_ACT_PIPE);
     }
-    let udp: UdpHdr = ctx.load(EthHdr::LEN + Ipv4Hdr::LEN).map_err(|_| ())?;
+    let udp: UdpHdr = ctx.load(l3_off + Ipv4Hdr::LEN).map_err(|_| ())?;
 
     let mangler_port = (cfg(0) & 0xffff) as u16;
     let wg_port = (cfg(1) & 0xffff) as u16;
@@ -450,7 +571,7 @@ unsafe fn try_encode(ctx: &TcContext) -> Result<i32, ()> {
         return Ok(TC_ACT_PIPE);
     }
 
-    let payload_off = EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN;
+    let payload_off = l3_off + Ipv4Hdr::LEN + UdpHdr::LEN;
     let wire_len = (ctx.len() as usize)
         .checked_sub(payload_off)
         .unwrap_or(0) as u32;
