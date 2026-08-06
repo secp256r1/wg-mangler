@@ -29,6 +29,11 @@ const MAX_UDP_PAYLOAD: usize = u16::MAX as usize - 28;
 const MAX_SESSIONS_PER_WORKER: usize = 256;
 const DERIVED_KEY_NUM: usize = 64;
 const DERIVED_KEY_LEN: usize = 8;
+// The standard WireGuard listen port; assumed on the kernel-mode server when
+// `--forward` is omitted (matches `wg-quick`'s default). Used only by the
+// `kernel` feature's `run_kernel`.
+#[cfg(feature = "kernel")]
+const DEFAULT_WG_PORT: u16 = 51820;
 
 #[derive(Parser)]
 #[command(author, version, about)]
@@ -44,6 +49,19 @@ enum Commands {
     Client(ForwarderArgs),
 }
 
+/// Parse a base58-encoded 32-byte shared secret (as printed by
+/// `generate-key`) into its raw bytes. Used by clap via `value_parser`,
+/// so `--key` is validated and decoded before any subcommand runs.
+fn parse_key(s: &str) -> Result<[u8; 32]> {
+    bs58::decode(s.as_bytes())
+        .into_array_const::<32>()
+        .map_err(|e| {
+            anyhow!(
+                "invalid key: {e} (expected a base58-encoded 32-byte secret from `generate-key`)"
+            )
+        })
+}
+
 #[derive(Args)]
 struct ForwarderArgs {
     /// Local listen address.
@@ -53,11 +71,18 @@ struct ForwarderArgs {
     #[arg(long, short)]
     listen: Option<SocketAddrV4>,
 
+    /// Forward address (`IP:PORT`, IPv4 only -- no DNS/hostnames).
+    /// Required in userspace mode (the proxy's remote endpoint, and for the
+    /// server the local WireGuard daemon) and for the kernel client (the
+    /// peer's mangler endpoint, which supplies the ports/IP matched on the
+    /// wire). Optional in kernel server mode: only the local WG daemon's
+    /// listen port is used, defaulting to the standard WG port (51820)
+    /// when omitted.
     #[arg(long, short)]
-    forward: String,
+    forward: Option<SocketAddrV4>,
 
-    #[arg(long, short)]
-    key: String,
+    #[arg(long, short, value_parser = parse_key)]
+    key: [u8; 32],
 
     #[arg(long, default_value_t = 180)]
     timeout: u64,
@@ -261,9 +286,9 @@ fn get_cpus_num() -> usize {
 async fn run_dispatch(args: ForwarderArgs, is_client: bool) -> Result<()> {
     if args.kernel {
         // Kernel mode: the client binds nothing locally -- `--listen` is not
-        // needed (the interface is picked from the route to the peer, and the
-        // peer's ports come from `--forward`). The server still needs the
-        // mangler port, which `--listen` carries.
+        // needed (the interface is picked from the route to the peer, and
+        // the peer's ports/IP come from `--forward`). The server still needs
+        // the mangler port (`--listen`); `--forward` is optional there.
         if !is_client && args.listen.is_none() {
             bail!("server mode requires --listen (the public mangler port)");
         }
@@ -275,6 +300,12 @@ async fn run_dispatch(args: ForwarderArgs, is_client: bool) -> Result<()> {
                  points at); omit it only with --kernel"
             );
         }
+        if args.forward.is_none() {
+            bail!(
+                "userspace mode requires --forward (the address to forward \
+                 decoded packets to)"
+            );
+        }
         run_forwarder(args, is_client).await
     }
 }
@@ -282,14 +313,27 @@ async fn run_dispatch(args: ForwarderArgs, is_client: bool) -> Result<()> {
 /// Kernel eBPF mode: load XDP/TC programs and let the kernel do the transform.
 #[cfg(feature = "kernel")]
 async fn run_kernel(args: ForwarderArgs, is_client: bool) -> Result<()> {
-    let forward_addr = tokio::net::lookup_host(&args.forward)
-        .await?
-        .next()
-        .ok_or_else(|| anyhow!("invalid forward address"))?;
-
-    let forward_v4 = match forward_addr {
-        SocketAddr::V4(v4) => v4,
-        _ => bail!("forward address must be IPv4"),
+    let forward_v4 = match args.forward {
+        // Explicit `--forward` (both roles): clap already parsed `IP:PORT`.
+        Some(addr) => addr,
+        // Kernel server without `--forward`: the WireGuard daemon runs on
+        // this host, so only its listen port is used (the XDP decode rewrites
+        // the dst port of matching packets onto it; the remote IP is not used
+        // server-side because decoded packets are delivered locally, never
+        // re-forwarded). Assume the standard wg port.
+        None if !is_client => {
+            info!(
+                "kernel server: --forward omitted, assuming the local WireGuard \
+                 daemon listens on the standard port {DEFAULT_WG_PORT}"
+            );
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, DEFAULT_WG_PORT)
+        }
+        // Kernel client: the peer's endpoint is required (ports + remote IP
+        // are injected into the eBPF CONFIG map).
+        None => bail!(
+            "kernel client mode requires --forward (the peer's mangler endpoint: \
+             IP:MG_PORT)"
+        ),
     };
 
     let listen = args.listen.unwrap_or_else(|| {
@@ -324,18 +368,9 @@ async fn run_forwarder(args: ForwarderArgs, is_client: bool) -> Result<()> {
     let listen = args.listen.expect("listen checked by run_dispatch");
     info!("Listening on: {listen}");
 
-    let key = Key::new(
-        bs58::decode(args.key.as_bytes())
-            .into_array_const::<32>()
-            .map_err(|e| {
-                anyhow!("invalid key: {e} (expected a base58-encoded 32-byte secret from `generate-key`)")
-            })?,
-    );
+    let key = Key::new(args.key);
     let timeout_duration = Duration::from_secs(args.timeout);
-    let forward_addr = tokio::net::lookup_host(&args.forward)
-        .await?
-        .next()
-        .ok_or_else(|| anyhow!("invalid forward address"))?;
+    let forward_addr = args.forward.expect("forward checked by run_dispatch");
 
     // NOTE: each worker binds its own SO_REUSEPORT listener and keeps its
     // own session table. This relies on the kernel steering all packets of
@@ -392,9 +427,7 @@ async fn run_forwarder(args: ForwarderArgs, is_client: bool) -> Result<()> {
                     let socket = match UdpSocket::bind("0.0.0.0:0").await {
                         Ok(v) => Arc::new(v),
                         Err(e) => {
-                            error!(
-                                "[Session {src_addr}] can not create the forwarder_socket: {e}"
-                            );
+                            error!("[Session {src_addr}] can not create the forwarder_socket: {e}");
                             // Keep serving the other clients on this worker.
                             continue;
                         }
@@ -674,7 +707,63 @@ mod tests {
     fn csum_add(field: u16, delta: u32) -> u16 {
         let c = ((!field as u32) & 0xffff) + (delta & 0xffff) + ((delta >> 16) & 0xffff);
         let c = (c & 0xffff) + (c >> 16);
+        // second fold: absorbs the carry-out of the first (kernel csum_fold
+        // does the same); without it a folded sum >= 0x10000 is truncated
+        // instead of wrapped and the field is off by one
+        let c = (c & 0xffff) + (c >> 16);
         !c as u16
+    }
+
+    #[test]
+    fn csum_add_fuzz_matches_reference_fold() {
+        // Independent reference: fold the full sum down mod 65535 (twice,
+        // exactly like the kernel's csum_fold) and complement. The production
+        // fold must agree even at the exact carry-out boundary (s == 0x1FFFF
+        // and friends), which the existing interop tests cannot hit reliably
+        // (they would need a 1-in-65536 luck per randomized packet).
+        fn ref_csum_add(field: u16, delta: u32) -> u16 {
+            let s = ((!field as u32) & 0xffff) + (delta & 0xffff) + ((delta >> 16) & 0xffff);
+            let s = (s & 0xffff) + (s >> 16);
+            let s = (s & 0xffff) + (s >> 16);
+            !s as u16
+        }
+        // boundary deltas across the whole field space
+        let deltas: [u32; 8] = [
+            0,
+            1,
+            0xffff,
+            0x10000,
+            0x1ffff,
+            0x2ffff,
+            u32::MAX,
+            0xdeadbeef,
+        ];
+        for field in 0..=u16::MAX {
+            for &delta in &deltas {
+                assert_eq!(
+                    csum_add(field, delta),
+                    ref_csum_add(field, delta),
+                    "field={field:#06x} delta={delta:#x}"
+                );
+            }
+        }
+        // exhaustive delta sweep around the carry boundaries
+        for delta in 0u32..=0x3ffff {
+            assert_eq!(
+                csum_add(0xffff, delta),
+                ref_csum_add(0xffff, delta),
+                "delta={delta:#x}"
+            );
+        }
+        // exhaustive field sweep with a heavy delta
+        let delta = 0x2ffffu32;
+        for field in 0..=u16::MAX {
+            assert_eq!(
+                csum_add(field, delta),
+                ref_csum_add(field, delta),
+                "field={field:#06x}"
+            );
+        }
     }
 
     #[test]
@@ -717,14 +806,28 @@ mod tests {
             let garbage = 1 + (rnd() % 0xfffe) as u16;
             for check in [full_check, partial_check, garbage] {
                 let (out, new_check, new_dport) = ebpf_decode_mirror(
-                    &buf[..encoded], &key, true, mangler_port, wg_port,
-                    src, dst, sport, mangler_port, ulen, check,
+                    &buf[..encoded],
+                    &key,
+                    true,
+                    mangler_port,
+                    wg_port,
+                    src,
+                    dst,
+                    sport,
+                    mangler_port,
+                    ulen,
+                    check,
                 );
                 assert_eq!(out.len(), size, "pad={} check={check:04x}", encoded - size);
                 assert_eq!(new_dport, wg_port);
                 let expect =
                     wire_checksum(src, dst, sport, wg_port, (size + 8) as u16, &out[..size]);
-                assert_eq!(new_check, expect, "pad={} check={check:04x}", encoded - size);
+                assert_eq!(
+                    new_check,
+                    expect,
+                    "pad={} check={check:04x}",
+                    encoded - size
+                );
             }
         }
     }
@@ -757,8 +860,17 @@ mod tests {
                 continue; // 0 = no checksum; the mirror keeps 0 (same as eBPF)
             }
             let (out, new_check, _) = ebpf_decode_mirror(
-                &buf[..wire_len], &key, is_server, mangler_port, wg_port,
-                src, dst, sport, mangler_port, ulen, check,
+                &buf[..wire_len],
+                &key,
+                is_server,
+                mangler_port,
+                wg_port,
+                src,
+                dst,
+                sport,
+                mangler_port,
+                ulen,
+                check,
             );
             assert_eq!(out.len(), wire_len);
             let nd = if is_server { wg_port } else { mangler_port };
@@ -803,8 +915,18 @@ mod tests {
 
             // COMPLETE input: the incremental update must equal a fresh computation
             let (mangled, enc_check, new_sport) = ebpf_encode_mirror(
-                &buf[..size], &key, is_server, mangler_port, wg_port,
-                src, dst, sport, dport, ulen, full_check, &mut rnd,
+                &buf[..size],
+                &key,
+                is_server,
+                mangler_port,
+                wg_port,
+                src,
+                dst,
+                sport,
+                dport,
+                ulen,
+                full_check,
+                &mut rnd,
             );
             let ns = if is_server { mangler_port } else { sport };
             assert_eq!(new_sport, ns);
@@ -815,8 +937,18 @@ mod tests {
             // device completes the payload part over the final bytes, and
             // the result matches a fresh computation (completion invariant).
             let (_mangled2, p_check, new_sport2) = ebpf_encode_mirror(
-                &buf[..size], &key, is_server, mangler_port, wg_port,
-                src, dst, sport, dport, ulen, partial_check, &mut rnd,
+                &buf[..size],
+                &key,
+                is_server,
+                mangler_port,
+                wg_port,
+                src,
+                dst,
+                sport,
+                dport,
+                ulen,
+                partial_check,
+                &mut rnd,
             );
             assert_eq!(p_check, partial_pseudo(src, dst, ulen), "type={msg_type}");
             // The PARTIAL branch leaves the field exactly as the kernel's
@@ -844,11 +976,7 @@ mod tests {
     /// RFC/BE sum space (no byte swap).
     fn word_delta_test(old: u16, new: u16) -> u32 {
         let d = (new as i32) - (old as i32);
-        if d < 0 {
-            (d + 65535) as u32
-        } else {
-            d as u32
-        }
+        if d < 0 { (d + 65535) as u32 } else { d as u32 }
     }
 
     /// Semantics of bpf_csum_diff(from=pre, to=post): Σpost - Σpre
@@ -1046,52 +1174,124 @@ mod tests {
             // Direction 1: userspace encode -> kernel decode (server)
             let encoded = obfuscate(&mut buf[..], size, &key, true).unwrap();
             let wire_ulen = (8 + encoded) as u16;
-            let wire_check = wire_checksum(src, dst, 51820, mangler_port, wire_ulen, &buf[..encoded]);
+            let wire_check =
+                wire_checksum(src, dst, 51820, mangler_port, wire_ulen, &buf[..encoded]);
             let (decoded, new_check, new_dport) = ebpf_decode_mirror(
-                &buf[..encoded], &key, true, mangler_port, wg_port, src, dst,
-                51820, mangler_port, wire_ulen, wire_check,
+                &buf[..encoded],
+                &key,
+                true,
+                mangler_port,
+                wg_port,
+                src,
+                dst,
+                51820,
+                mangler_port,
+                wire_ulen,
+                wire_check,
             );
             assert_eq!(decoded.len(), size, "type {msg_type}");
             assert_eq!(&decoded[..size], &original[..size], "type {msg_type} bytes");
-            let expect_check = wire_checksum(src, dst, 51820, wg_port, (size + 8) as u16, &decoded[..size]);
+            let expect_check = wire_checksum(
+                src,
+                dst,
+                51820,
+                wg_port,
+                (size + 8) as u16,
+                &decoded[..size],
+            );
             assert_eq!(new_check, expect_check, "type {msg_type} checksum");
             assert_eq!(new_dport, wg_port);
 
             // Direction 2: kernel encode (server) -> userspace decode
             // the WG daemon's original message from wg_port -> TC encode + sport rewrite
             let (mangled, enc_check, new_sport) = ebpf_encode_mirror(
-                &original[..size], &key, true, mangler_port, wg_port, src, dst,
-                wg_port, 51820, (size + 8) as u16,
-                wire_checksum(src, dst, wg_port, 51820, (size + 8) as u16, &original[..size]),
+                &original[..size],
+                &key,
+                true,
+                mangler_port,
+                wg_port,
+                src,
+                dst,
+                wg_port,
+                51820,
+                (size + 8) as u16,
+                wire_checksum(
+                    src,
+                    dst,
+                    wg_port,
+                    51820,
+                    (size + 8) as u16,
+                    &original[..size],
+                ),
                 &mut rnd,
             );
             assert_eq!(new_sport, mangler_port);
             // the checksum delta must be correct (fresh over on-wire bytes)
-            let expect_enc = wire_checksum(src, dst, mangler_port, 51820, (size + 8) as u16, &mangled);
+            let expect_enc =
+                wire_checksum(src, dst, mangler_port, 51820, (size + 8) as u16, &mangled);
             assert_eq!(enc_check, expect_enc, "type {msg_type} enc checksum");
             // userspace decode must restore (note: kernel never pads; len unchanged)
             let mut dec_buf = [0u8; MAX_UDP_SIZE];
             dec_buf[..mangled.len()].copy_from_slice(&mangled);
             let decoded = obfuscate(&mut dec_buf[..], mangled.len(), &key, false).unwrap();
             assert_eq!(decoded, size, "type {msg_type} userspace decoded len");
-            assert_eq!(&dec_buf[..size], &original[..size], "type {msg_type} userspace decoded bytes");
+            assert_eq!(
+                &dec_buf[..size],
+                &original[..size],
+                "type {msg_type} userspace decoded bytes"
+            );
 
             // Direction 3: kernel encode -> kernel decode (dual-kernel deployment)
             let (mangled2, enc2, _) = ebpf_encode_mirror(
-                &original[..size], &key, true, mangler_port, wg_port, src, dst,
-                wg_port, 51820, (size + 8) as u16,
-                wire_checksum(src, dst, wg_port, 51820, (size + 8) as u16, &original[..size]),
+                &original[..size],
+                &key,
+                true,
+                mangler_port,
+                wg_port,
+                src,
+                dst,
+                wg_port,
+                51820,
+                (size + 8) as u16,
+                wire_checksum(
+                    src,
+                    dst,
+                    wg_port,
+                    51820,
+                    (size + 8) as u16,
+                    &original[..size],
+                ),
                 &mut rnd,
             );
             let ulen2 = (8 + mangled2.len()) as u16;
             let check2 = wire_checksum(src, dst, mangler_port, 51820, ulen2, &mangled2);
             let (decoded2, ncheck2, dport2) = ebpf_decode_mirror(
-                &mangled2, &key, false, mangler_port, wg_port, src, dst,
-                mangler_port, 51820, ulen2, check2,
+                &mangled2,
+                &key,
+                false,
+                mangler_port,
+                wg_port,
+                src,
+                dst,
+                mangler_port,
+                51820,
+                ulen2,
+                check2,
             );
             assert_eq!(decoded2.len(), size, "type {msg_type} kk len");
-            assert_eq!(&decoded2[..size], &original[..size], "type {msg_type} kk bytes");
-            let expect_kk = wire_checksum(src, dst, mangler_port, 51820, (size + 8) as u16, &decoded2[..size]);
+            assert_eq!(
+                &decoded2[..size],
+                &original[..size],
+                "type {msg_type} kk bytes"
+            );
+            let expect_kk = wire_checksum(
+                src,
+                dst,
+                mangler_port,
+                51820,
+                (size + 8) as u16,
+                &decoded2[..size],
+            );
             assert_eq!(ncheck2, expect_kk, "type {msg_type} kk checksum");
             assert_eq!(dport2, 51820);
             assert_eq!(enc2, check2); // encoded on-wire checksum matches a fresh computation

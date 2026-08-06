@@ -27,16 +27,14 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 
 use anyhow::{Context, Result};
 use aya::{
-    include_bytes_aligned,
+    Ebpf, include_bytes_aligned,
     maps::Array,
     programs::{SchedClassifier, TcAttachType, Xdp, XdpMode, tc},
-    Ebpf,
 };
 use log::{info, warn};
-use sha2::{Digest, Sha256};
 use tokio::signal;
 
-use crate::{DERIVED_KEY_NUM, DERIVED_KEY_LEN};
+use crate::DERIVED_KEY_NUM;
 
 /// Run the eBPF kernel-mode transform.
 ///
@@ -47,13 +45,14 @@ use crate::{DERIVED_KEY_NUM, DERIVED_KEY_LEN};
 ///   client matches the peer's mangler port on both hooks, because the
 ///   server rewrites its source port to MG_PORT, exactly like the userspace
 ///   proxy does)
-/// `key`         → base58-encoded 32-byte shared secret
+/// `key`         → raw 32-byte shared secret (base58 decoding happens in the
+///                 CLI parser, so the secret is validated before startup)
 /// `is_client`   → true for client mode, false for server
 /// `iface_name`  → optional network interface name; auto-detected if `None`
 pub async fn run_kernel_ebpf(
     listen: SocketAddrV4,
     forward: SocketAddrV4,
-    key: &str,
+    key: &[u8; 32],
     is_client: bool,
     iface_name: Option<&str>,
 ) -> Result<()> {
@@ -83,11 +82,7 @@ pub async fn run_kernel_ebpf(
     )))
     .context("failed to load eBPF object")?;
 
-    // Inject the derived keys
-    let seed: [u8; 32] = bs58::decode(key.as_bytes())
-        .into_array_const::<32>()
-        .map_err(|e| anyhow::anyhow!("invalid key: {e}"))?;
-    let derived = derive_keys(&seed);
+    let derived = crate::Key::new(*key).0;
 
     let mut keys_map: Array<_, [u8; 8]> =
         Array::try_from(bpf.map_mut("WGKEYS").context("map WGKEYS not found")?)
@@ -173,18 +168,6 @@ pub async fn run_kernel_ebpf(
     info!("Exiting kernel eBPF mode.");
 
     Ok(())
-}
-
-/// SHA-256 derived 64 keys of 8 bytes each, identical to `Key::new`
-fn derive_keys(seed: &[u8; 32]) -> [[u8; DERIVED_KEY_LEN]; DERIVED_KEY_NUM] {
-    let mut derived = [[0u8; DERIVED_KEY_LEN]; DERIVED_KEY_NUM];
-    for (i, v) in derived.iter_mut().enumerate() {
-        let mut hasher = Sha256::new();
-        hasher.update(seed);
-        hasher.update((i as u32).to_le_bytes());
-        v.copy_from_slice(&hasher.finalize()[..DERIVED_KEY_LEN]);
-    }
-    derived
 }
 
 /// Find the interface that carries traffic to `ip` (auto-detection).
