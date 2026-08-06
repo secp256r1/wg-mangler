@@ -48,5 +48,5 @@ panic = "abort"
 # interfere with the .BTF/license sections the kernel loader expects.
 [profile.release.package.wg-mangler-ebpf]
 strip = "none"
-opt-level = "s"
+opt-level = "2"
 codegen-units = 16
