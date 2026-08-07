@@ -34,7 +34,7 @@ use aya::{
 use log::{info, warn};
 use tokio::signal;
 
-use crate::DERIVED_KEY_NUM;
+use crate::run::DERIVED_KEY_NUM;
 
 /// Render an error with its full source chain (the `#[source]` io::Error in
 /// aya's `SyscallError` carries the actual errno, which the plain `Display`
@@ -59,10 +59,10 @@ fn err_chain(err: &(dyn std::error::Error + 'static)) -> String {
 ///   client matches the peer's mangler port on both hooks, because the
 ///   server rewrites its source port to MG_PORT, exactly like the userspace
 ///   proxy does)
-/// `key`         → raw 32-byte shared secret (base58 decoding happens in the
-///                 CLI parser, so the secret is validated before startup)
-/// `is_client`   → true for client mode, false for server
-/// `iface_name`  → optional network interface name; auto-detected if `None`
+/// * `key` → raw 32-byte shared secret (base58 decoding happens in the
+///   CLI parser, so the secret is validated before startup)
+/// * `is_client`   → true for client mode, false for server
+/// * `iface_name`  → optional network interface name; auto-detected if `None`
 pub async fn run_kernel_ebpf(
     listen: SocketAddrV4,
     forward: SocketAddrV4,
@@ -96,7 +96,7 @@ pub async fn run_kernel_ebpf(
     )))
     .context("failed to load eBPF object")?;
 
-    let derived = crate::Key::new(*key).0;
+    let derived = crate::run::Key::new(*key).0;
 
     let mut keys_map: Array<_, [u8; 8]> =
         Array::try_from(bpf.map_mut("WGKEYS").context("map WGKEYS not found")?)

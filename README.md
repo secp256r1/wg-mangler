@@ -202,7 +202,7 @@ scheduling per packet. Kernel mode removes all of that.
 
 ## Acknowledgements
 
-- **Gemini:** For assisting with a significant portion of the coding work.
+- **LLM:** For assisting with a significant portion of the coding work.
 - **[phantun](https://github.com/dndx/phantun)**: A long-term tool used before `wg-mangler`.
 - **[udp2raw](https://github.com/wangyu-/udp2raw)**: Another long-term tool used before `wg-mangler`.
 
