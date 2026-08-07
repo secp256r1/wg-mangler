@@ -96,6 +96,11 @@ Endpoint = 127.0.0.1:15820
 
 Now your WireGuard traffic will be seamlessly obfuscated through `wg-mangler`.
 
+> Running the client with `--kernel` (Kernel eBPF mode)? The peer
+> configuration is different — the client binds no local listener, so the
+> `Endpoint` must point at the remote mangler instead. See
+> [step 4](#4-kernel-ebpf-mode-linux).
+
 ### 4. Kernel eBPF Mode (Linux)
 
 The userspace proxy costs one syscall pair + buffer copy + context switch per
@@ -147,6 +152,21 @@ wg-mangler server --listen 0.0.0.0:12345 --forward 127.0.0.1:51820 --key key --k
 wg-mangler client --forward YOUR_VPS_IP:12345 --key key --kernel
 ```
 
+Kernel-mode flags:
+
+- `--kernel`: Use the kernel eBPF transform (XDP ingress + TC egress)
+  instead of the userspace proxy. Requires Linux, root privileges, and a
+  build with the `kernel` feature. On the **server**, `--listen` still
+  gives the public mangler port; `--forward` becomes optional and only
+  supplies the local WireGuard daemon's listen port (assumed
+  `127.0.0.1:51820` when omitted). On the **client**, `--listen` is not
+  needed (the client binds nothing locally) and `--forward` is required:
+  it is the peer's mangler endpoint, whose `IP`/`port` are injected into
+  the eBPF programs.
+- `--iface`: Attach the eBPF programs to this specific interface. Only
+  used in kernel mode; auto-detected if omitted (see the interface rules
+  below).
+
 Kernel mode needs root and an interface with XDP support. The interface is
 auto-detected (override with `--iface`): the server uses the interface that
 owns its listen address (or the default route for `0.0.0.0`), and the client
@@ -154,25 +174,24 @@ uses the route to the remote endpoint (`--forward` IP) — never its own
 `--listen` address, which is ignored in kernel mode and would otherwise
 resolve to `lo`.
 
-**How the programs fit the no-proxy topology** (WireGuard talks directly to
-`Endpoint = YOUR_VPS_IP:12345`):
-
-> **Switching the client from userspace to kernel mode changes the WG
-> endpoint**: userspace mode proxies on `127.0.0.1` (`Endpoint =
-> 127.0.0.1:<listen port>`), kernel mode requires the *remote* endpoint
-> (`Endpoint = YOUR_VPS_IP:12345`) — kernel mode binds nothing locally
-> (`--listen` is not needed) and only transforms packets on the attached
-> interface. Also make sure the client's WireGuard traffic actually
-> traverses the attached interface (`tc qdisc`/XDP hooks are
-> per-interface); the interface is auto-detected from the route to the
-> peer, or pin it with `--iface`.
+**WireGuard peer configuration (client with `--kernel`):** the kernel-mode
+client binds nothing locally — it only transforms packets on the attached
+interface — so the WireGuard peer's `Endpoint` no longer points at the local
+proxy (`127.0.0.1:<listen port>`). It points directly at the remote
+mangler, i.e. the same `IP:MG_PORT` that was passed to `--forward`:
 
 ```text
-client:  TC egress:  dport == 12345                  → encode
-         XDP ingress: src == VPS && sport == 12345   → decode
-server:  XDP ingress: dport == 12345  → decode + port rewrite → 51820
-         TC egress:  sport == 51820                  → encode (sport → 12345)
+[Peer]
+Endpoint = YOUR_VPS_IP:12345
+...
 ```
+
+For comparison, the userspace client instead uses
+`Endpoint = 127.0.0.1:15820` (see [step 3](#3-run-the-client)). The client's
+WireGuard traffic must also actually traverse the attached interface —
+XDP/TC hooks are per-interface — which is why the interface is
+auto-detected from the route to the peer (or you can pin it explicitly
+with `--iface`, e.g. with policy routing).
 
 Both programs are passive: they only transform matching packets and pass
 everything else through (`XDP_PASS` / `TC_ACT_PIPE`). The checksum fixup is
