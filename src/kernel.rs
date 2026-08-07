@@ -36,6 +36,20 @@ use tokio::signal;
 
 use crate::DERIVED_KEY_NUM;
 
+/// Render an error with its full source chain (the `#[source]` io::Error in
+/// aya's `SyscallError` carries the actual errno, which the plain `Display`
+/// omits).
+fn err_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut src = err.source();
+    while let Some(s) = src {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        src = s.source();
+    }
+    out
+}
+
 /// Run the eBPF kernel-mode transform.
 ///
 /// * server: `listen` = `0.0.0.0:MG_PORT` (public mangler port),
@@ -140,7 +154,10 @@ pub async fn run_kernel_ebpf(
             link
         }
         Err(e) => {
-            warn!("native XDP attach failed: {e}; falling back to generic XDP (skb)");
+            warn!(
+                "native XDP attach failed: {}; falling back to generic XDP (skb)",
+                err_chain(&e)
+            );
             program
                 .attach(&iface_name, XdpMode::Skb)
                 .context("failed to attach XDP program (native and generic)")?
