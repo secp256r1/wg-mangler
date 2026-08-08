@@ -1,3 +1,48 @@
+## 0.2.4 - 2026-08-08
+
+- **feat(cli): TCP transport mode (`--tcp`)** -- run the network between the
+  two manglers over TCP instead of UDP (useful where UDP is throttled or
+  filtered). The client binds a local UDP port (same as before) and opens a
+  TCP connection per WireGuard source to the server; the server accepts TCP
+  connections and relays the frames to/from the local WireGuard daemon over
+  UDP, each connection acting as one session with its own forwarder socket.
+  - on-wire frame format: `[random 2-byte key index][payload length
+    XORed with derived key bytes][payload]` -- the first two random bytes
+    are an index into the shared derived-key table, exactly like the first
+    two bytes of the UDP `obfuscate` header: the receiver looks up
+    `used_key = key.get(index)` and the two length bytes are XORed with
+    `get_key_byte(used_key, 3)` and `get_key_byte(used_key, 6)` (LE
+    length, bytewise XOR, so decode is symmetric). Payloads are capped at
+    the UDP payload limit (65507) and oversized length fields are rejected
+    without allocating.
+  - `--listen`/`--forward` semantics per role: client -- UDP listen port
+    (the WireGuard `Endpoint`) + the server's TCP endpoint; server -- the
+    public TCP port + the local WireGuard daemon address. `--key` is
+    shared as usual (it derives the per-frame key bytes; a wrong key
+    cannot recover the frame length); `--tcp` is rejected together with
+    `--kernel`.
+  - sessions, limits and timeouts mirror the UDP proxy: 256 sessions per
+    worker, `--timeout` inactivity teardown (server closes the connection,
+    client follows on EOF), self-healing reconnect on the next packet, and
+    EOF/error paths wake the opposite direction via a `watch` channel.
+  - **`TCP_NODELAY` on both the client and the server sockets**: every WG
+    datagram is written as its own small frame; without it Nagle would
+    hold each frame until the previous one is ACKed, pacing one frame per
+    RTT on a real WAN (page loads crawl). The client session also runs the
+    outbound and inbound paths as two separate tasks so heavy outbound
+    traffic can never starve the inbound path (the original single select
+    loop biased toward whichever direction had queued data). Session map
+    entries now hold `Arc<UnboundedSender>` so cleanup removes an entry by
+    pointer identity -- no removal can ever take out a newly re-created
+    session.
+  - hardened the session lookup in the tcp client loop: the sessions read
+    guard is cloned before taking the write lock (the match-scrutinee
+    pattern deadlocked the worker loop).
+  - unit tests for the frame format (header round trip, per-frame key XOR,
+    oversized-length rejection, stream reassembly via `tokio::io::duplex`,
+    clean-EOF handling); verified end-to-end with a local TCP client +
+    server + UDP echo proxy.
+
 ## 0.2.3 - 2026-08-06
 
 - fix(ebpf): **incremental delta no longer uses `bpf_csum_diff`** -- the

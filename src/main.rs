@@ -101,6 +101,26 @@ pub struct ForwarderArgs {
     #[arg(long, default_value_t = false)]
     pub kernel: bool,
 
+    /// Use the TCP transport mode instead of the plain UDP proxy.
+    /// The network between the two manglers runs over TCP connections
+    /// (useful where UDP is throttled or filtered): the client connects to
+    /// the server, the server accepts connections, and every WireGuard
+    /// datagram crosses the tunnel as a TCP frame of the form
+    /// `[length ^ used_key 2B][obfuscate-encoded datagram]`.
+    /// The payload is the exact wire format of UDP mode (`obfuscate`
+    /// output: random 4-byte header + XORed body, handshakes optionally
+    /// padded), so no raw WireGuard bytes appear on the stream. Its first
+    /// 2 bytes select the derived key from the shared `--key` table
+    /// (exactly like the UDP obfuscate header), and the two length bytes
+    /// are XORed with derived key bytes 3 and 6.
+    /// In this mode `--listen` is a UDP port on the client (where your
+    /// WireGuard peer points) and the public TCP port on the server, and
+    /// `--forward` is the server's TCP endpoint on the client and your
+    /// local WireGuard daemon address on the server. `--key` must be
+    /// shared between both ends, as in the UDP mode.
+    #[arg(long, default_value_t = false)]
+    pub tcp: bool,
+
     /// Network interface to attach eBPF programs to.
     /// Only used in kernel mode; auto-detected if omitted.
     #[arg(long)]

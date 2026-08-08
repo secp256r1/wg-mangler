@@ -9,7 +9,8 @@
   - [1. Generate Key](#1-generate-key)
   - [2. Run the Server](#2-run-the-server)
   - [3. Run the Client](#3-run-the-client)
-  - [4. Kernel eBPF Mode (Linux)](#4-kernel-ebpf-mode-linux)
+  - [4. TCP Mode](#4-tcp-mode)
+  - [5. Kernel eBPF Mode (Linux)](#5-kernel-ebpf-mode-linux)
 - [Why Kernel Mode?](#why-kernel-mode)
 - [Acknowledgements](#acknowledgements)
 - [Similar Tools](#similar-tools)
@@ -28,6 +29,10 @@ Its simplicity is a key feature: it requires no `tun` devices and no `nftables` 
 - **Low Resource Usage:** Small memory and CPU footprint.
 - **OpenWrt Support:** Works great on embedded Linux devices.
 - **Minimal Latency:** Fast header-only transformation adds negligible delay.
+- **TCP Transport Mode:** where UDP is throttled or filtered, `--tcp` runs the
+  the relay over TCP connections instead — one connection per WireGuard
+  source, each datagram carried in a `[length xor key bytes][obfuscated
+  datagram]` frame derived from the shared `--key`.
 
 ## How It Works
 
@@ -99,9 +104,56 @@ Now your WireGuard traffic will be seamlessly obfuscated through `wg-mangler`.
 > Running the client with `--kernel` (Kernel eBPF mode)? The peer
 > configuration is different — the client binds no local listener, so the
 > `Endpoint` must point at the remote mangler instead. See
-> [step 4](#4-kernel-ebpf-mode-linux).
+> [step 5](#5-kernel-ebpf-mode-linux).
 
-### 4. Kernel eBPF Mode (Linux)
+### 4. TCP Mode
+
+Some networks throttle or filter UDP, which breaks WireGuard's default
+transport. Add `--tcp` to run the network between the two manglers over TCP
+connections instead: the **client connects (TCP) to the server** and streams
+framed datagrams, the **server listens (TCP) and relays** the frames to your
+WireGuard daemon over local UDP — exactly the same topology as the UDP
+proxy, different wire transport.
+
+- **Client**: `--listen` is still a local **UDP** port (`Endpoint =
+  127.0.0.1:15820` in your WireGuard config, as in step 3); `--forward` is
+  the server's **TCP** endpoint (`YOUR_VPS_IP:12345`).
+- **Server**: `--listen` is the public **TCP** port; `--forward` is your
+  local WireGuard daemon's UDP address, as usual.
+- One TCP connection is opened per WireGuard source socket and reused; a
+  session (and its connection) ends after `--timeout` seconds without
+  traffic, but the next packet simply opens a new one.
+- `TCP_NODELAY` is set on both ends: the frames are pre-packaged datagrams
+  and must not wait on Nagle's ACK clock, which would otherwise series
+  them one round trip apart on a real WAN.
+- The same shared `--key` as the UDP mode: the 2 random bytes at the start
+  of each frame are an index into the shared derived-key table, so only
+  the two manglers can recover the length.
+
+```sh
+# On your VPS (server side)
+wg-mangler server --tcp --listen 0.0.0.0:12345 --forward 127.0.0.1:51820 --key key
+
+# On your local machine (client side)
+wg-mangler client --tcp --listen 127.0.0.1:15820 --forward YOUR_VPS_IP:12345 --key key
+```
+
+**TCP frame format:** every WireGuard datagram crosses the tunnel as
+`[payload length xor key bytes 2B][obfuscate-encoded datagram]`. The
+payload is byte-identical to what UDP mode puts on the wire — the output
+of `obfuscate` (`[random 2-byte key index][key-byte index][type ^ key
+byte][XORed body]`, handshakes optionally padded with 0–63 random bytes) —
+so no raw WireGuard bytes appear on the TCP stream. Its first 2 bytes are
+used exactly like the first 2 bytes of the mangled UDP packets:
+`Key::get()` looks up the 8-byte derived key for that index from the shared
+key table (each `--key` derives 64 × 8-byte keys). The length field is then
+XORed byte-wise: the first byte with derived key byte 3
+(`get_key_byte(used_key, 3)`), the second with byte 6 — so the length is
+hidden, no two frames look alike, and a byte stream can carry datagrams.
+The receiving end strips the framing and runs the payload through
+`obfuscate(.., decode)` to recover the original WireGuard datagram.
+
+### 5. Kernel eBPF Mode (Linux)
 
 The userspace proxy costs one syscall pair + buffer copy + context switch per
 packet. On Linux you can instead run the transform inside the kernel with XDP

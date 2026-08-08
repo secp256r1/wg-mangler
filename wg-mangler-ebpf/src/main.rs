@@ -85,6 +85,12 @@ const MAX_VLAN_TAGS: usize = 2;
 const SNAP: usize = 160;
 /// Upstream (userspace) peers pad handshakes by at most 63 bytes.
 const MAX_PAD: u32 = 64;
+/// Data keepalives (32 bytes) get 0..=64 random padding from userspace;
+/// bit 7 of the key-byte index (packet[2]) marks padding presence:
+/// 0 = padded keepalive, 1 = plain data packet. The pad length is inferred
+/// from the wire length (pad = len - 32).
+const KEEPALIVE_PAD_MAX: u32 = 64;
+const KEEPALIVE_PAD_BIT: u8 = 0x80;
 
 /// 64 derived 8-byte keys (index = LE bytes 0-1 of the header).
 #[map]
@@ -392,12 +398,20 @@ unsafe fn try_decode(ctx: &XdpContext) -> Result<u32, ()> {
         3 => (64, 64),
         _ => return Ok(xdp_action::XDP_PASS),
     };
+    // Data keepalives can be trimmed to 32 bytes (userspace pads them with
+    // 0..=31 bytes); the snapshot must cover the full 32-byte message
+    // (restored 16-byte header + untouched ciphertext) for the from-scratch
+    // checksum. Handshakes keep snap_end == chg_end == size.
+    let snap_end = if msg_type == 4 { 32u32 } else { chg_end };
     // Bounds for the whole mutated region (including snapshot reads):
     if (payload as *const u8).add(chg_end as usize) > ctx.data_end() as *const u8 {
         return Ok(xdp_action::XDP_PASS);
     }
+    if (payload as *const u8).add(snap_end as usize) > ctx.data_end() as *const u8 {
+        return Ok(xdp_action::XDP_PASS);
+    }
     let wire_len = (ctx.data_end() - payload as usize) as u32;
-    let sn = chg_end.min(SNAP as u32) as usize;
+    let sn = snap_end.min(SNAP as u32) as usize;
 
     // Snapshot + restore (before any mutation)
     let mut pre = [0u8; SNAP];
@@ -408,7 +422,9 @@ unsafe fn try_decode(ctx: &XdpContext) -> Result<u32, ()> {
     post[1] = 0;
     post[2] = 0;
     post[3] = 0;
-    for i in 4..sn {
+    // XOR only the changed header region (data: 4..16; handshake: the whole
+    // body up to chg_end == size). Ciphertext beyond that is untouched.
+    for i in 4..(chg_end as usize) {
         // userspace convention: packet[4+j] ^= key[j % 8], i.e. key[(i-4) % 8]
         post[i] ^= ((key_bits >> ((((i - 4) as u32) & 7) * 8)) & 0xff) as u8;
     }
@@ -423,12 +439,24 @@ unsafe fn try_decode(ctx: &XdpContext) -> Result<u32, ()> {
 
     let mut new_ulen: u16 = old_ulen;
     let mut trim_len: u32 = 0;
+    let mut trim_to: u32 = size;
     if msg_type != 4 && wire_len != size {
         let pad = wire_len - size;
         if pad <= MAX_PAD {
             new_ulen = (size + 8) as u16;
             trim_len = pad;
         }
+    } else if msg_type == 4
+        && (kbidx & KEEPALIVE_PAD_BIT) == 0
+        && wire_len >= 32
+        && wire_len <= 32 + KEEPALIVE_PAD_MAX
+    {
+        // Userspace keepalive padding: bit 7 of the key-byte index
+        // (packet[2]) is 0 and the pad length is inferred from the wire
+        // length.
+        trim_to = 32;
+        new_ulen = (trim_to + 8) as u16;
+        trim_len = wire_len - 32;
     }
 
     let new_dport = if is_server { wg_port } else { dport };
@@ -457,7 +485,7 @@ unsafe fn try_decode(ctx: &XdpContext) -> Result<u32, ()> {
     // fails (e.g. generic XDP on a non-linear/GRO skb) the packet must be
     // left exactly as it arrived, so bail out of the whole transform here.
     if trim_len != 0 {
-        let shrink = (size as i64 - wire_len as i64) as i32;
+        let shrink = (trim_to as i64 - wire_len as i64) as i32;
         if unsafe { bpf_xdp_adjust_tail(ctx.ctx, shrink) } != 0 {
             return Ok(xdp_action::XDP_PASS);
         }
@@ -472,9 +500,10 @@ unsafe fn try_decode(ctx: &XdpContext) -> Result<u32, ()> {
     let udp_mut = ptr_at_mut::<UdpHdr>(ctx, l3_off + Ipv4Hdr::LEN)?;
     let payload = (udp_mut as *const u8).add(UdpHdr::LEN) as *mut u8;
     // Re-establish the mutation-region bounds against the (possibly
-    // shortened) data_end; for handshake messages chg_end == size, so the
-    // trimmed packet satisfies this exactly.
-    if (payload as *const u8).add(chg_end as usize) > ctx.data_end() as *const u8 {
+    // shortened) data_end; `sn` is the snapshot/write length (handshake
+    // size, or 32 for data keepalives), which the trimmed packet satisfies
+    // exactly.
+    if (payload as *const u8).add(sn as usize) > ctx.data_end() as *const u8 {
         return Ok(xdp_action::XDP_PASS);
     }
     core::ptr::copy_nonoverlapping(post.as_ptr(), payload, sn);
@@ -490,7 +519,7 @@ unsafe fn try_decode(ctx: &XdpContext) -> Result<u32, ()> {
     if trim_len != 0 {
         let ip_mut = ptr_at_mut::<Ipv4Hdr>(ctx, l3_off)?;
         let ihl = ((*ip_mut).vihl & 0x0f) as u16;
-        let new_tlen = ihl * 4 + 8 + size as u16;
+        let new_tlen = ihl * 4 + 8 + trim_to as u16;
         (*udp_mut).len = new_ulen.to_be_bytes();
         (*ip_mut).tot_len = new_tlen.to_be_bytes();
         (*ip_mut).check = ip_checksum(
@@ -624,7 +653,13 @@ unsafe fn try_encode(ctx: &TcContext) -> Result<i32, ()> {
     // Random header: bytes0-1 = LE key index, byte2 = key-byte index, byte3 = type ^ key
     let rnd = unsafe { bpf_get_prandom_u32() };
     let kidx = (rnd & 0xffff) as u16;
-    let kbidx = (rnd >> 16) as u8;
+    let mut kbidx = (rnd >> 16) as u8;
+    // Data packets set bit 7 of the key-byte index to mark "no padding"
+    // (keepalives are not padded by the kernel path), so the peer's
+    // decoder can tell a plain data packet from a padded keepalive.
+    if msg_type == 4 {
+        kbidx |= KEEPALIVE_PAD_BIT;
+    }
     let key = key_at(kidx);
     let key_bits = u64::from_le_bytes(key);
     post[0] = (kidx & 0xff) as u8;

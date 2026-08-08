@@ -6,7 +6,7 @@ default-members = ["."]
 
 [package]
 name = "wg-mangler"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 description = "a program used to obfuscate WireGuard message headers"
 
