@@ -3,11 +3,11 @@
 
 use std::{
     collections::HashMap,
-    io::ErrorKind,
+    io::{ErrorKind, IoSlice},
     net::{SocketAddr, SocketAddrV4},
     sync::{
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
-        Arc,
     },
     time::Duration,
 };
@@ -21,10 +21,10 @@ use anyhow::{Result, bail};
 use log::{debug, error, info};
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     spawn,
-    sync::{mpsc, RwLock},
+    sync::{RwLock, mpsc},
 };
 
 use crate::ForwarderArgs;
@@ -85,12 +85,13 @@ fn obfuscate(packet: &mut [u8], len: usize, key: &Key, is_encode: bool) -> Resul
     // sizes, and packet[2] stays fully random).
     let (message_type, used_key, data_pad, is_keepalive_pad) = if is_encode {
         let message_type = packet[0];
-        packet[0..4].copy_from_slice(&getrandom::u32()?.to_le_bytes());
+        let rnd = getrandom::u64()?;
+        packet[0..4].copy_from_slice(&(rnd as u32).to_le_bytes());
         let used_key = key.get(&packet[..2])?;
         let mut kbidx = packet[2];
         let data_pad = if message_type == 4 && len == 32 {
             // Cap so `len + pad` never exceeds the UDP payload limit.
-            let pad = ((getrandom::u32()? as u8 % (KEEPALIVE_PAD_MAX as u8 + 1)) as usize)
+            let pad = (((rnd >> 32) as u8 % (KEEPALIVE_PAD_MAX as u8 + 1)) as usize)
                 .min(MAX_UDP_PAYLOAD.saturating_sub(len));
             // Padded keepalive: bit 7 = 0.
             kbidx &= !KEEPALIVE_PAD_BIT;
@@ -158,7 +159,9 @@ fn obfuscate(packet: &mut [u8], len: usize, key: &Key, is_encode: bool) -> Resul
         // handshake and cookie
         1..=3 => {
             if is_encode {
-                let padding_size = (getrandom::u32()? as u8 % 64) as usize;
+                let mut rnd = [0u8; 64];
+                getrandom::fill(&mut rnd)?;
+                let padding_size = (rnd[0] % 64) as usize;
                 // Cap at the real UDP payload limit (65507 bytes); anything
                 // larger would fail in send_to with EMSGSIZE.
                 let padding_len = (len + padding_size).min(MAX_UDP_PAYLOAD);
@@ -166,7 +169,8 @@ fn obfuscate(packet: &mut [u8], len: usize, key: &Key, is_encode: bool) -> Resul
                 // packet plus the padding region); the rest of the scratch
                 // buffer holds stale data and must not be touched.
                 xor_transform(&mut packet[4..padding_len], used_key);
-                getrandom::fill(&mut packet[len..padding_len])?;
+                let pad = padding_len - len;
+                packet[len..padding_len].copy_from_slice(&rnd[1..1 + pad]);
                 padding_len
             } else {
                 let size = match message_type {
@@ -201,9 +205,128 @@ fn new_reuseport_udp_socket(addr: SocketAddrV4) -> Result<UdpSocket> {
     }
 
     udp_sock.set_nonblocking(true)?;
+    // A larger receive queue absorbs WireGuard's short bursts without
+    // drops on the local relay socket (Linux doubles the requested value).
+    let _ = udp_sock.set_recv_buffer_size(UDP_RCVBUF);
     udp_sock.bind(&socket2::SockAddr::from(addr))?;
     let udp_sock: std::net::UdpSocket = udp_sock.into();
     Ok(udp_sock.try_into()?)
+}
+
+/// Bind an ephemeral UDP socket, connect it to the peer, and enlarge its
+/// receive queue. Connecting means `send`/`recv` skip the per-datagram
+/// destination lookup and the kernel filters replies to the peer's exact
+/// 4-tuple -- safe because every proxy socket talks to exactly one peer
+/// (`forward_addr`), which always replies from that address (the remote
+/// mangler's SO_REUSEPORT workers all share `forward_addr`, and the local
+/// WireGuard daemon replies from its own bound address).
+async fn new_proxy_socket(forward_addr: SocketAddrV4) -> Result<Arc<UdpSocket>> {
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    socket.connect(forward_addr).await?;
+    if let Err(e) = socket2::SockRef::from(&socket).set_recv_buffer_size(UDP_RCVBUF) {
+        debug!("set_recv_buffer_size failed: {e}");
+    }
+    Ok(Arc::new(socket))
+}
+
+/// Relay one received WireGuard datagram on the userspace UDP forwarder:
+/// validate + obfuscate it, route it to the source's session (creating the
+/// session on first contact), and send it to the peer through the proxy
+/// socket. Shared by the listen loop's first recv and its non-blocking
+/// drain.
+#[allow(clippy::too_many_arguments)]
+async fn relay_udp_datagram(
+    is_client: bool,
+    listen_socket: &Arc<UdpSocket>,
+    forward_addr: SocketAddrV4,
+    src_addr: SocketAddr,
+    buf: &mut [u8],
+    len: usize,
+    key: &Key,
+    sessions: &Arc<RwLock<HashMap<SocketAddr, Arc<UdpSocket>>>>,
+    timeout_duration: Duration,
+) {
+    // Validate and mangle the packet BEFORE creating a session: an invalid
+    // packet from an unknown source must not be able to allocate a session
+    // (socket + task) that lingers until it times out, or spoofed sources
+    // could exhaust resources.
+    let padding_len = match obfuscate(&mut buf[..], len, key, is_client) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("[Session {src_addr}] Failed to obfuscate packet: {e}");
+            return;
+        }
+    };
+
+    // Fast path: reuse an existing session for this source.
+    let existing = sessions.read().await.get(&src_addr).cloned();
+    let proxy_socket = if let Some(socket) = existing {
+        socket
+    } else {
+        // New session: bind + connect the proxy socket outside the lock so
+        // we never await while holding the sessions lock (the reverse-path
+        // cleanup task needs it to remove expired sessions).
+        let socket = match new_proxy_socket(forward_addr).await {
+            Ok(v) => v,
+            Err(e) => {
+                error!("[Session {src_addr}] can not create the forwarder_socket: {e}");
+                // Keep serving the other clients on this worker.
+                return;
+            }
+        };
+
+        let mut guard = sessions.write().await;
+        // NOTE: the forward loop is the only task that inserts sessions
+        // (reverse-path tasks only remove), so a plain get-then-insert is
+        // race-free here. Use the entry API if a concurrent inserter is
+        // ever introduced.
+        if let Some(socket) = guard.get(&src_addr) {
+            socket.clone()
+        } else {
+            // Bound sessions so spoofed sources cannot exhaust sockets and
+            // tasks: each session occupies a socket and a task until the
+            // inactivity timeout.
+            if guard.len() >= MAX_SESSIONS_PER_WORKER {
+                error!(
+                    "[Session {src_addr}] Session limit ({MAX_SESSIONS_PER_WORKER}) reached; dropping packet"
+                );
+                return;
+            }
+
+            info!("[Session {src_addr}] New connection established.");
+            guard.insert(src_addr, socket.clone());
+
+            {
+                let listen_socket = listen_socket.clone();
+                let key = key.clone();
+                let sessions = sessions.clone();
+                let forwarder_socket = socket.clone();
+                spawn(async move {
+                    handle_forward_socket(
+                        is_client,
+                        listen_socket,
+                        forwarder_socket,
+                        src_addr,
+                        &key,
+                        sessions,
+                        timeout_duration,
+                    )
+                    .await;
+                });
+            }
+
+            socket
+        }
+    };
+
+    if let Err(e) = proxy_socket.send(&buf[..padding_len]).await {
+        error!("[Session {src_addr}] Failed to send packet: {e}");
+        // The proxy socket is likely broken. Remove the session so the next
+        // packet from this source binds a fresh socket; the old reverse-path
+        // task keeps draining the old socket until it times out, so upstream
+        // replies already in flight are still forwarded in the meantime.
+        sessions.write().await.remove(&src_addr);
+    }
 }
 
 async fn handle_forward_socket(
@@ -216,10 +339,10 @@ async fn handle_forward_socket(
     timeout_duration: Duration,
 ) {
     let mut buf = [0u8; MAX_UDP_SIZE];
-    loop {
-        match tokio::time::timeout(timeout_duration, proxy_socket.recv_from(&mut buf)).await {
-            Ok(Ok((len, from_addr))) => {
-                debug!("Reverse: Received {len} bytes from {from_addr}");
+    'session: loop {
+        match tokio::time::timeout(timeout_duration, proxy_socket.recv(&mut buf)).await {
+            Ok(Ok(len)) => {
+                debug!("Reverse: Received {len} bytes");
 
                 let trim_len = match obfuscate(&mut buf[..], len, key, !is_client) {
                     Ok(v) => v,
@@ -233,7 +356,43 @@ async fn handle_forward_socket(
                     error!(
                         "[Session {original_src}] Failed to send packet back to original source: {e}",
                     );
-                    break;
+                    break 'session;
+                }
+
+                // Non-blocking drain: upstream replies arrive in bursts (one
+                // per forwarded datagram); forward whatever is already queued
+                // in this wakeup instead of one blocking recv per packet.
+                for _ in 0..UDP_DRAIN_CAP {
+                    match proxy_socket.try_recv(&mut buf) {
+                        Ok(0) => break,
+                        Ok(len) => {
+                            let trim_len = match obfuscate(&mut buf[..], len, key, !is_client) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    error!(
+                                        "[Session {original_src}] Failed to transform packet: {e}"
+                                    );
+                                    continue;
+                                }
+                            };
+                            if let Err(e) =
+                                listen_socket.send_to(&buf[..trim_len], original_src).await
+                            {
+                                error!(
+                                    "[Session {original_src}] Failed to send packet back to original source: {e}",
+                                );
+                                // Same as above: a send failure tears the
+                                // session down.
+                                break 'session;
+                            }
+                        }
+                        Err(e) => {
+                            if e.kind() != ErrorKind::WouldBlock {
+                                error!("[Session {original_src}] proxy_socket try_recv error: {e}");
+                            }
+                            break;
+                        }
+                    }
                 }
             }
             // An error occurred while receiving on the proxy socket
@@ -281,10 +440,78 @@ const MAX_TCP_PAYLOAD: usize = MAX_UDP_PAYLOAD;
 // anything shorter on the wire means a wrong key or a corrupt frame.
 const MIN_TCP_PAYLOAD: usize = 4;
 
+/// Capacity of every pooled frame: a full UDP datagram plus headroom for
+/// the 2-byte TCP length field written in front.
+const FRAME_CAP: usize = MAX_TCP_PAYLOAD + TCP_FRAME_HEADER_LEN;
+
+/// A reusable encoded TCP frame. `buf` is always `FRAME_CAP` bytes so the
+/// producer can `recv` straight into it; `buf[..len]` is the frame to
+/// transmit (2-byte length field + obfuscate-encoded datagram).
+struct Frame {
+    buf: Box<[u8]>,
+    len: usize,
+}
+
+/// Recycler for `Frame` buffers, shared between the UDP receive loop
+/// (producer) and the TCP writer task (consumer). The client hot path used
+/// to copy every encoded frame into a fresh `Vec` (`buf[..len].to_vec()`);
+/// with a pool, the receive happens directly into a pooled buffer, the
+/// frame moves to the writer by ownership, and the writer returns it after
+/// the write -- no per-packet allocation or copy.
+#[derive(Clone)]
+struct FramePool {
+    free: Arc<Mutex<Vec<Frame>>>,
+}
+
+impl FramePool {
+    fn new() -> Self {
+        FramePool {
+            free: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Take a frame buffer from the pool, or allocate a fresh one when the
+    /// pool is empty.
+    fn acquire(&self) -> Frame {
+        let buf = self
+            .free
+            .lock()
+            .unwrap()
+            .pop()
+            .map(|f| f.buf)
+            .unwrap_or_else(|| vec![0u8; FRAME_CAP].into_boxed_slice());
+        Frame { buf, len: 0 }
+    }
+
+    /// Return a frame buffer to the pool for reuse.
+    fn release(&self, frame: Frame) {
+        self.free.lock().unwrap().push(frame);
+    }
+}
+
+/// Maximum bytes coalesced into a single `writev` before the TCP writer
+/// flushes. Frames are pre-packaged datagrams; batching is what turns a
+/// burst of frames into one syscall instead of one per frame.
+const TCP_WRITE_BATCH_BYTES: usize = 64 * 1024;
+/// Maximum frames coalesced into a single `writev`.
+const TCP_WRITE_BATCH_FRAMES: usize = 32;
+/// Cap on datagrams drained non-blocking after one blocking recv, so a
+/// sustained burst cannot monopolize a worker.
+const UDP_DRAIN_CAP: usize = 64;
+/// UDP receive buffer size for the mangler's listen / relay sockets.
+/// WireGuard peers emit short bursts; a larger kernel queue absorbs them
+/// without drops. Linux doubles the requested value, so 512 KiB requests
+/// ~1 MiB of kernel buffer.
+const UDP_RCVBUF: usize = 512 * 1024;
+/// TCP send/receive buffer size for the tunnel streams. Mostly a no-op on
+/// modern kernels (which autotune), kept for low-end boxes whose sysctls
+/// cap autotuning low.
+const TCP_BUFSIZE: usize = 512 * 1024;
+
 /// Per-session frame queue handle on the TCP client: `src_addr` -> sender.
 /// Wrapped in `Arc` so a session can verify (by pointer identity) that the
 /// map entry it cleans up is still its own.
-type TcpSessionSender = Arc<mpsc::UnboundedSender<Vec<u8>>>;
+type TcpSessionSender = Arc<mpsc::UnboundedSender<Frame>>;
 type TcpSessions = Arc<RwLock<HashMap<SocketAddr, TcpSessionSender>>>;
 
 /// Build the 2-byte TCP frame length field for a payload of `payload_len`
@@ -333,47 +560,292 @@ fn encode_tcp_frame(frame: &mut [u8], len: usize, key: &Key) -> Result<usize> {
     Ok(mangled_len + TCP_FRAME_HEADER_LEN)
 }
 
-/// Read and decode the next TCP frame from `reader` into `payload[..len]`.
-/// The payload read back is the obfuscate-encoded datagram (its first 2
-/// bytes are the key index the length field was keyed on); the caller
-/// passes it to `obfuscate(.., false)` to recover the WireGuard datagram.
-/// Returns `Ok(None)` when the connection ends cleanly at a frame boundary
-/// (peer closed), `Ok(Some(len))` for a complete frame, or an error for a
-/// truncated/oversized frame or a transport failure.
-async fn read_tcp_frame<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    payload: &mut [u8],
+/// Bytes read per `read` syscall on the TCP stream. Frames are parsed out
+/// of this buffer, so a burst of back-to-back frames costs one syscall per
+/// chunk instead of three `read_exact` calls per frame.
+const TCP_READ_CHUNK: usize = 16 * 1024;
+
+/// A buffered reader that parses wg-mangler TCP frames out of a byte
+/// stream (each frame is `[2-byte length ^ key][2-byte key index][payload]`).
+/// It tops the buffer up with one `read` at a time and serves frames from
+/// it, so a burst of frames costs ~1 syscall per chunk instead of the 3
+/// `read_exact` calls the old `read_tcp_frame` made per frame (length
+/// field, key index, body). Frames larger than the chunk are streamed
+/// directly out of the socket.
+struct TcpFrameReader<R: AsyncRead + Unpin> {
+    reader: R,
+    buf: Vec<u8>,
+    len: usize,
+    pos: usize,
+    eof: bool,
+}
+
+impl<R: AsyncRead + Unpin> TcpFrameReader<R> {
+    fn new(reader: R) -> Self {
+        TcpFrameReader {
+            reader,
+            buf: vec![0u8; TCP_READ_CHUNK],
+            len: 0,
+            pos: 0,
+            eof: false,
+        }
+    }
+
+    /// Move unread bytes to the front and top the buffer up with one read.
+    /// Returns `Ok(false)` on clean EOF (no new bytes were available).
+    async fn refill(&mut self) -> std::io::Result<bool> {
+        self.buf.copy_within(self.pos..self.len, 0);
+        self.len -= self.pos;
+        self.pos = 0;
+        let n = self.reader.read(&mut self.buf[self.len..]).await?;
+        if n == 0 {
+            self.eof = true;
+            return Ok(false);
+        }
+        self.len += n;
+        Ok(true)
+    }
+
+    /// Ensure at least `need` bytes are buffered; `Ok(false)` on clean EOF
+    /// before that many bytes are available.
+    async fn ensure(&mut self, need: usize) -> std::io::Result<bool> {
+        while self.len - self.pos < need {
+            if self.eof {
+                return Ok(false);
+            }
+            if !self.refill().await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Read the next frame's obfuscate-encoded payload into `payload`
+    /// (`payload[..len]`; its first 2 bytes are the key index the length
+    /// field was keyed on). The caller passes it to `obfuscate(.., false)`
+    /// to recover the WireGuard datagram. Returns `Ok(None)` when the
+    /// connection ends cleanly at a frame boundary (peer closed), or an
+    /// error for a truncated/oversized frame or a transport failure.
+    async fn next_frame(&mut self, payload: &mut [u8], key: &Key) -> Result<Option<usize>> {
+        // Header: 2-byte length field + 2-byte key index.
+        if !self.ensure(TCP_FRAME_HEADER_LEN * 2).await? {
+            // EOF before a frame's first byte: clean close by the peer
+            // (a mid-header EOF is not byte-perfect, but the session is
+            // over either way).
+            return Ok(None);
+        }
+        let len_field = [self.buf[self.pos], self.buf[self.pos + 1]];
+        let key_index = [self.buf[self.pos + 2], self.buf[self.pos + 3]];
+        let used_key = key.get(&key_index)?;
+        let payload_len = decode_tcp_frame_header(&len_field, used_key)?;
+        if !(MIN_TCP_PAYLOAD..=MAX_TCP_PAYLOAD).contains(&payload_len) {
+            bail!("invalid TCP frame length: {payload_len}");
+        }
+        if payload_len > payload.len() {
+            bail!("TCP frame does not fit the receive buffer: {payload_len}");
+        }
+        payload[..TCP_FRAME_HEADER_LEN].copy_from_slice(&key_index);
+        self.pos += TCP_FRAME_HEADER_LEN * 2;
+
+        // Body: the rest of the obfuscate-encoded datagram.
+        let body_len = payload_len - TCP_FRAME_HEADER_LEN;
+        let buffered = self.len - self.pos;
+        if buffered >= body_len {
+            payload[TCP_FRAME_HEADER_LEN..payload_len]
+                .copy_from_slice(&self.buf[self.pos..self.pos + body_len]);
+            self.pos += body_len;
+        } else {
+            // The frame is larger than what is buffered: consume the
+            // buffer, then read the remainder straight from the stream
+            // (all buffered bytes belong to this frame, which is not yet
+            // complete).
+            payload[TCP_FRAME_HEADER_LEN..TCP_FRAME_HEADER_LEN + buffered]
+                .copy_from_slice(&self.buf[self.pos..self.len]);
+            self.pos = self.len;
+            let mut done = buffered;
+            while done < body_len {
+                if self.eof {
+                    bail!("truncated TCP frame body");
+                }
+                let want = body_len - done;
+                let n = self
+                    .reader
+                    .read(
+                        &mut payload
+                            [TCP_FRAME_HEADER_LEN + done..TCP_FRAME_HEADER_LEN + done + want],
+                    )
+                    .await?;
+                if n == 0 {
+                    self.eof = true;
+                    bail!("truncated TCP frame body");
+                }
+                done += n;
+            }
+        }
+        Ok(Some(payload_len))
+    }
+}
+
+/// Write a batch of encoded frames to `writer` in a single `writev` syscall
+/// and return every frame to the pool afterwards (whether the write
+/// succeeded or not). An empty batch is a no-op.
+async fn write_frame_batch<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frames: &mut Vec<Frame>,
+    pool: &FramePool,
+) -> std::io::Result<()> {
+    if frames.is_empty() {
+        return Ok(());
+    }
+    let result = async {
+        let total: usize = frames.iter().map(|f| f.len).sum();
+        let mut written = 0usize;
+        while written < total {
+            // Build iovecs for the unwritten tail of the batch:
+            // `write_vectored` can return a partial write, so loop until
+            // every byte is out (on a ready stream this is usually one
+            // syscall for the whole batch).
+            let mut iovecs = Vec::with_capacity(frames.len());
+            let mut off = 0usize;
+            for f in frames.iter() {
+                let start = written.saturating_sub(off).min(f.len);
+                if start < f.len {
+                    iovecs.push(IoSlice::new(&f.buf[start..f.len]));
+                }
+                off += f.len;
+            }
+            let n = writer.write_vectored(&iovecs).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "write_vectored made no progress",
+                ));
+            }
+            written += n;
+        }
+        Ok::<(), std::io::Error>(())
+    }
+    .await;
+    // `iovecs` is no longer used: recycle every frame regardless of outcome.
+    for f in frames.drain(..) {
+        pool.release(f);
+    }
+    result
+}
+
+/// Non-blocking drain of a connected relay socket: encode up to `cap`
+/// already-queued datagrams into pooled frames. Returns an empty vector
+/// when nothing is queued. `peer` is only used for error logging.
+fn drain_udp_batch(
+    udp: &UdpSocket,
+    pool: &FramePool,
     key: &Key,
-) -> Result<Option<usize>> {
-    let mut len_field = [0u8; TCP_FRAME_HEADER_LEN];
-    match reader.read_exact(&mut len_field).await {
-        Ok(_) => {}
-        // EOF before a frame's first byte: clean close by the peer
-        // (a mid-header EOF is not byte-perfect, but the session is over
-        // either way).
-        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
+    peer: SocketAddr,
+    cap: usize,
+) -> Vec<Frame> {
+    let mut batch = Vec::with_capacity(cap);
+    for _ in 0..cap {
+        let mut f = pool.acquire();
+        match udp.try_recv(&mut f.buf[TCP_FRAME_HEADER_LEN..]) {
+            Ok(0) => {
+                pool.release(f);
+                break;
+            }
+            Ok(len) => match encode_tcp_frame(&mut f.buf, len, key) {
+                Ok(frame_len) => {
+                    f.len = frame_len;
+                    batch.push(f);
+                }
+                Err(e) => {
+                    error!("[Session {peer}] Failed to obfuscate packet: {e}");
+                    pool.release(f);
+                    break;
+                }
+            },
+            Err(e) => {
+                pool.release(f);
+                if e.kind() != ErrorKind::WouldBlock {
+                    error!("[Session {peer}] Error draining forwarder socket: {e}");
+                }
+                break;
+            }
+        }
     }
-    // The length field is keyed by the payload's own key index, so read
-    // the payload's first 2 bytes before we can decode the length.
-    match reader.read_exact(&mut payload[..TCP_FRAME_HEADER_LEN]).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
+    batch
+}
+
+/// Enqueue one encoded frame for `src_addr` on the TCP client, opening a
+/// new TCP tunnel (and reader task) on first contact from that source.
+/// The frame buffer is handed to the session's writer by ownership and
+/// recycled when the write completes; on the rare failure paths it is
+/// returned to the pool here.
+#[allow(clippy::too_many_arguments)]
+async fn route_tcp_frame(
+    src_addr: SocketAddr,
+    frame: Frame,
+    forward: SocketAddrV4,
+    listen_socket: &Arc<UdpSocket>,
+    sessions: &TcpSessions,
+    timeout_duration: Duration,
+    key: &Key,
+    pool: &FramePool,
+) {
+    // Reuse this source's session, or open a TCP tunnel (and a reader task)
+    // for a new source. Clone out of the read guard first so the match arms
+    // never touch the lock while the read guard is still alive (the write
+    // lock below must not wait on it -- same pattern as the UDP proxy).
+    let existing = sessions.read().await.get(&src_addr).cloned();
+    let tx = match existing {
+        Some(tx) => tx,
+        None => {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let tx = Arc::new(tx);
+            let mut guard = sessions.write().await;
+            if let Some(tx) = guard.get(&src_addr) {
+                tx.clone()
+            } else {
+                if guard.len() >= MAX_SESSIONS_PER_WORKER {
+                    error!(
+                        "[Session {src_addr}] Session limit ({MAX_SESSIONS_PER_WORKER}) reached; dropping packet"
+                    );
+                    pool.release(frame);
+                    return;
+                }
+                info!("[Session {src_addr}] New connection established.");
+                guard.insert(src_addr, tx.clone());
+                {
+                    let listen_socket = listen_socket.clone();
+                    let sessions = sessions.clone();
+                    let key = key.clone();
+                    let session_tx = tx.clone();
+                    let pool = pool.clone();
+                    spawn(async move {
+                        client_tcp_session(
+                            src_addr,
+                            forward,
+                            listen_socket,
+                            rx,
+                            session_tx,
+                            sessions,
+                            timeout_duration,
+                            key,
+                            pool,
+                        )
+                        .await;
+                    });
+                }
+                tx
+            }
+        }
+    };
+
+    if let Err(send_err) = tx.send(frame) {
+        // The session's TCP connection is gone; drop the entry so the next
+        // packet from this source opens a fresh one, and recycle the frame.
+        error!("[Session {src_addr}] Failed to queue frame for TCP stream");
+        sessions.write().await.remove(&src_addr);
+        pool.release(send_err.0);
     }
-    let used_key = key.get(&payload[..TCP_FRAME_HEADER_LEN])?;
-    let payload_len = decode_tcp_frame_header(&len_field, used_key)?;
-    if !(MIN_TCP_PAYLOAD..=MAX_TCP_PAYLOAD).contains(&payload_len) {
-        bail!("invalid TCP frame length: {payload_len}");
-    }
-    if payload_len > payload.len() {
-        bail!("TCP frame does not fit the receive buffer: {payload_len}");
-    }
-    reader
-        .read_exact(&mut payload[TCP_FRAME_HEADER_LEN..payload_len])
-        .await
-        .map_err(anyhow::Error::from)?;
-    Ok(Some(payload_len))
 }
 
 fn new_reuseport_tcp_listener(addr: SocketAddrV4) -> Result<TcpListener> {
@@ -408,11 +880,12 @@ async fn client_tcp_session(
     src_addr: SocketAddr,
     forward: SocketAddrV4,
     listen_socket: Arc<UdpSocket>,
-    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut rx: mpsc::UnboundedReceiver<Frame>,
     session_tx: TcpSessionSender,
     sessions: TcpSessions,
     timeout_duration: Duration,
     key: Key,
+    pool: FramePool,
 ) {
     let stream = match TcpStream::connect(forward).await {
         Ok(stream) => stream,
@@ -428,29 +901,49 @@ async fn client_tcp_session(
     if let Err(e) = stream.set_nodelay(true) {
         error!("[Session {src_addr}] set_nodelay failed: {e}");
     }
+    // tokio's TcpStream exposes no buffer-size setters (only the
+    // pre-connect TcpSocket does); go through socket2 instead.
+    if let Err(e) = socket2::SockRef::from(&stream).set_send_buffer_size(TCP_BUFSIZE) {
+        debug!("[Session {src_addr}] set_send_buffer_size failed: {e}");
+    }
     info!("[Session {src_addr}] TCP connection to {forward} established.");
 
-    let (mut reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = stream.into_split();
 
     // Outbound path (frames queued by the listener loop -> TCP), as its
     // own task so a busy stream of outbound frames can never starve the
     // inbound path below (a single select loop would always prefer
-    // whichever direction has data queued).
+    // whichever direction has data queued). Frames already queued behind
+    // the first one are coalesced into a single `writev`.
     let writer_task = spawn(async move {
+        let mut batch: Vec<Frame> = Vec::with_capacity(TCP_WRITE_BATCH_FRAMES);
         while let Some(frame) = rx.recv().await {
-            if let Err(e) = writer.write_all(&frame).await {
+            let mut batch_bytes = frame.len;
+            batch.push(frame);
+            while batch.len() < TCP_WRITE_BATCH_FRAMES && batch_bytes < TCP_WRITE_BATCH_BYTES {
+                match rx.try_recv() {
+                    Ok(f) => {
+                        batch_bytes += f.len;
+                        batch.push(f);
+                    }
+                    Err(_) => break,
+                }
+            }
+            if let Err(e) = write_frame_batch(&mut writer, &mut batch, &pool).await {
                 error!("[Session {src_addr}] Failed to write to TCP stream: {e}");
                 break;
             }
         }
     });
 
-    // Inbound path (TCP frames -> UDP back to the WireGuard source).
+    // Inbound path (TCP frames -> UDP back to the WireGuard source). The
+    // buffered frame reader coalesces back-to-back frames into one `read`.
+    let mut frame_reader = TcpFrameReader::new(reader);
     let mut payload = vec![0u8; MAX_TCP_PAYLOAD];
     loop {
         match tokio::time::timeout(
             timeout_duration,
-            read_tcp_frame(&mut reader, &mut payload, &key),
+            frame_reader.next_frame(&mut payload, &key),
         )
         .await
         {
@@ -530,86 +1023,92 @@ async fn run_tcp_client(
                 }
             };
             let sessions: TcpSessions = Arc::new(RwLock::new(HashMap::new()));
+            // Frames travel through a per-worker pool: receive directly into
+            // a pooled buffer, hand it to the session writer by ownership,
+            // and recycle it once the write completes. This keeps the hot
+            // path allocation- and copy-free.
+            let pool = FramePool::new();
 
-            // + TCP_FRAME_HEADER_LEN bytes of headroom for the length field
-            // (obfuscate may also add up to 63 bytes of handshake padding,
-            // but the receive buffer is sized for the full UDP payload).
-            let mut buf = [0u8; MAX_TCP_PAYLOAD + TCP_FRAME_HEADER_LEN];
             loop {
-                let (len, src_addr) =
-                    match listen_socket.recv_from(&mut buf[TCP_FRAME_HEADER_LEN..]).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            error!("listen_socket recv_from error: {e}");
-                            continue;
-                        }
-                    };
-                debug!("listen socket: received {len} bytes from {src_addr}");
-
-                // Encode the raw WireGuard datagram into a full TCP frame
-                // in place: obfuscate it exactly as UDP mode does, then
-                // write the [ length ^ used_key ] field in front.
-                let frame_len = match encode_tcp_frame(&mut buf, len, &key) {
+                let mut frame = pool.acquire();
+                let (len, src_addr) = match listen_socket
+                    .recv_from(&mut frame.buf[TCP_FRAME_HEADER_LEN..])
+                    .await
+                {
                     Ok(v) => v,
                     Err(e) => {
-                        error!("[Session {src_addr}] Failed to obfuscate packet: {e}");
+                        error!("listen_socket recv_from error: {e}");
+                        pool.release(frame);
                         continue;
                     }
                 };
-                let frame = buf[..frame_len].to_vec();
-
-                // Reuse this source's session, or open a TCP tunnel (and a
-                // reader task) for a new source. Clone out of the read
-                // guard first so the match arms never touch the lock while
-                // the read guard is still alive (the write lock below must
-                // not wait on it -- same pattern as the UDP proxy).
-                let existing = sessions.read().await.get(&src_addr).cloned();
-                let tx = match existing {
-                    Some(tx) => tx,
-                    None => {
-                        let (tx, rx) = mpsc::unbounded_channel();
-                        let tx = Arc::new(tx);
-                        let mut guard = sessions.write().await;
-                        if let Some(tx) = guard.get(&src_addr) {
-                            tx.clone()
-                        } else {
-                            if guard.len() >= MAX_SESSIONS_PER_WORKER {
-                                error!(
-                                    "[Session {src_addr}] Session limit ({MAX_SESSIONS_PER_WORKER}) reached; dropping packet"
-                                );
-                                continue;
-                            }
-                            info!("[Session {src_addr}] New connection established.");
-                            guard.insert(src_addr, tx.clone());
-                            {
-                                let listen_socket = listen_socket.clone();
-                                let sessions = sessions.clone();
-                                let key = key.clone();
-                                let session_tx = tx.clone();
-                                spawn(async move {
-                                    client_tcp_session(
-                                        src_addr,
-                                        forward,
-                                        listen_socket,
-                                        rx,
-                                        session_tx,
-                                        sessions,
-                                        timeout_duration,
-                                        key,
-                                    )
-                                    .await;
-                                });
-                            }
-                            tx
-                        }
+                debug!("listen socket: received {len} bytes from {src_addr}");
+                // Encode the raw WireGuard datagram into a full TCP frame
+                // in place: obfuscate it exactly as UDP mode does, then
+                // write the [ length ^ used_key ] field in front.
+                let frame = match encode_tcp_frame(&mut frame.buf, len, &key) {
+                    Ok(frame_len) => {
+                        frame.len = frame_len;
+                        frame
+                    }
+                    Err(e) => {
+                        error!("[Session {src_addr}] Failed to obfuscate packet: {e}");
+                        pool.release(frame);
+                        continue;
                     }
                 };
+                route_tcp_frame(
+                    src_addr,
+                    frame,
+                    forward,
+                    &listen_socket,
+                    &sessions,
+                    timeout_duration,
+                    &key,
+                    &pool,
+                )
+                .await;
 
-                if let Err(e) = tx.send(frame) {
-                    // The session's TCP connection is gone; drop the entry
-                    // so the next packet from this source opens a fresh one.
-                    error!("[Session {src_addr}] Failed to queue frame for TCP stream: {e}");
-                    sessions.write().await.remove(&src_addr);
+                // Non-blocking drain: datagrams already queued behind the
+                // one above go through the same encode+route path in this
+                // iteration, so a burst costs one blocking recv plus a poll
+                // per packet instead of one blocking recv per packet.
+                for _ in 0..UDP_DRAIN_CAP {
+                    let mut frame = pool.acquire();
+                    match listen_socket.try_recv_from(&mut frame.buf[TCP_FRAME_HEADER_LEN..]) {
+                        Ok((len, src_addr)) => {
+                            debug!("listen socket: drained {len} bytes from {src_addr}");
+                            let frame = match encode_tcp_frame(&mut frame.buf, len, &key) {
+                                Ok(frame_len) => {
+                                    frame.len = frame_len;
+                                    frame
+                                }
+                                Err(e) => {
+                                    error!("[Session {src_addr}] Failed to obfuscate packet: {e}");
+                                    pool.release(frame);
+                                    continue;
+                                }
+                            };
+                            route_tcp_frame(
+                                src_addr,
+                                frame,
+                                forward,
+                                &listen_socket,
+                                &sessions,
+                                timeout_duration,
+                                &key,
+                                &pool,
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            pool.release(frame);
+                            if e.kind() != ErrorKind::WouldBlock {
+                                error!("listen_socket try_recv_from error: {e}");
+                            }
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -630,6 +1129,7 @@ async fn server_tcp_session(
     forward: SocketAddrV4,
     timeout_duration: Duration,
     key: Key,
+    pool: FramePool,
 ) {
     let udp = match UdpSocket::bind("0.0.0.0:0").await {
         Ok(v) => Arc::new(v),
@@ -638,12 +1138,26 @@ async fn server_tcp_session(
             return;
         }
     };
+    // Connect the relay socket to the WG daemon up front: `send` then skips
+    // the per-datagram destination lookup and `recv` has the kernel filter
+    // by the connected 4-tuple. This relies on the daemon always replying
+    // from `forward`, which holds for a single local WireGuard instance.
+    if let Err(e) = udp.connect(forward).await {
+        error!("[Session {peer}] can not connect the forwarder socket to {forward}: {e}");
+        return;
+    }
+    if let Err(e) = socket2::SockRef::from(&*udp).set_recv_buffer_size(UDP_RCVBUF) {
+        debug!("[Session {peer}] set_recv_buffer_size failed: {e}");
+    }
     // See client_tcp_session: frames are already packaged datagrams and
     // must not wait on the Nagle/ACK clock (one frame per RTT on a WAN).
     if let Err(e) = stream.set_nodelay(true) {
         error!("[Session {peer}] set_nodelay failed: {e}");
     }
-    let (mut reader, mut writer) = stream.into_split();
+    if let Err(e) = socket2::SockRef::from(&stream).set_recv_buffer_size(TCP_BUFSIZE) {
+        debug!("[Session {peer}] set_recv_buffer_size failed: {e}");
+    }
+    let (reader, mut writer) = stream.into_split();
 
     // Inbound path: TCP frames from the client -> UDP to the WG daemon.
     // `closed_tx` drops (and so wakes the outbound select below) whenever
@@ -652,9 +1166,12 @@ async fn server_tcp_session(
     let udp_in = udp.clone();
     let key_in = key.clone();
     let reader_task = spawn(async move {
+        // The buffered frame reader coalesces back-to-back frames into one
+        // `read` syscall per chunk.
+        let mut frame_reader = TcpFrameReader::new(reader);
         let mut payload = vec![0u8; MAX_TCP_PAYLOAD];
         loop {
-            let len = match read_tcp_frame(&mut reader, &mut payload, &key_in).await {
+            let len = match frame_reader.next_frame(&mut payload, &key_in).await {
                 Ok(Some(len)) => len,
                 Ok(None) => {
                     info!("[Session {peer}] Connection closed by the client.");
@@ -674,7 +1191,7 @@ async fn server_tcp_session(
                     break;
                 }
             };
-            if let Err(e) = udp_in.send_to(&payload[..wg_len], forward).await {
+            if let Err(e) = udp_in.send(&payload[..wg_len]).await {
                 error!("[Session {peer}] Failed to send packet to {forward}: {e}");
                 break;
             }
@@ -682,37 +1199,62 @@ async fn server_tcp_session(
     });
 
     // Outbound path: WG daemon replies -> TCP frames back to the client.
-    let mut buf = [0u8; MAX_TCP_PAYLOAD + TCP_FRAME_HEADER_LEN];
+    // Replies arrive in bursts (one per inbound frame), so after the first
+    // blocking recv we drain whatever is already queued non-blocking and
+    // send the whole batch with a single writev, then recycle the buffers.
     loop {
         tokio::select! {
             // The inbound task ended (EOF, error): break immediately
             // instead of waiting out the inactivity timeout.
             _ = closed_rx.changed() => break,
-            recv = tokio::time::timeout(
-                timeout_duration,
-                udp.recv_from(&mut buf[TCP_FRAME_HEADER_LEN..]),
-            ) => {
+            recv = async {
+                let mut first = pool.acquire();
+                let res = tokio::time::timeout(
+                    timeout_duration,
+                    udp.recv(&mut first.buf[TCP_FRAME_HEADER_LEN..]),
+                )
+                .await;
+                (first, res)
+            } => {
+                let (mut first, recv) = recv;
                 let len = match recv {
-                    Ok(Ok((len, _from_addr))) => len,
+                    Ok(Ok(len)) => len,
                     Ok(Err(e)) => {
                         error!("[Session {peer}] Error receiving from forwarder socket: {e}");
+                        pool.release(first);
                         break;
                     }
                     Err(_) => {
                         info!("[Session {peer}] Timed out due to inactivity.");
+                        pool.release(first);
                         break;
                     }
                 };
                 // Encode the WG daemon's raw datagram into a full TCP
                 // frame in place, like the client's send path.
-                let frame_len = match encode_tcp_frame(&mut buf, len, &key) {
-                    Ok(v) => v,
+                let first = match encode_tcp_frame(&mut first.buf, len, &key) {
+                    Ok(frame_len) => {
+                        first.len = frame_len;
+                        first
+                    }
                     Err(e) => {
                         error!("[Session {peer}] Failed to obfuscate packet: {e}");
+                        pool.release(first);
                         break;
                     }
                 };
-                if let Err(e) = writer.write_all(&buf[..frame_len]).await {
+                let mut batch: Vec<Frame> = Vec::with_capacity(TCP_WRITE_BATCH_FRAMES);
+                batch.push(first);
+                // Replies arrive in bursts (one per inbound frame); drain
+                // whatever is already queued and send it all in one writev.
+                batch.extend(drain_udp_batch(
+                    &udp,
+                    &pool,
+                    &key,
+                    peer,
+                    TCP_WRITE_BATCH_FRAMES - batch.len(),
+                ));
+                if let Err(e) = write_frame_batch(&mut writer, &mut batch, &pool).await {
                     error!("[Session {peer}] Failed to write to TCP stream: {e}");
                     break;
                 }
@@ -753,6 +1295,8 @@ async fn run_tcp_server(
             };
             // Bound connections so floods cannot exhaust sockets and tasks.
             let session_count = Arc::new(AtomicUsize::new(0));
+            // One frame pool per worker, shared by all sessions it accepts.
+            let pool = FramePool::new();
             loop {
                 let (stream, peer) = match listener.accept().await {
                     Ok(v) => v,
@@ -771,8 +1315,9 @@ async fn run_tcp_server(
                 session_count.fetch_add(1, Ordering::Relaxed);
                 let session_count = session_count.clone();
                 let key = key.clone();
+                let pool = pool.clone();
                 spawn(async move {
-                    server_tcp_session(stream, peer, forward, timeout_duration, key).await;
+                    server_tcp_session(stream, peer, forward, timeout_duration, key, pool).await;
                     session_count.fetch_sub(1, Ordering::Relaxed);
                 });
             }
@@ -987,92 +1532,47 @@ async fn run_forwarder(args: ForwarderArgs, is_client: bool) -> Result<()> {
                     }
                 };
                 debug!("listen socket: received {len} bytes from {src_addr}");
+                relay_udp_datagram(
+                    is_client,
+                    &listen_socket,
+                    forward_addr,
+                    src_addr,
+                    &mut buf,
+                    len,
+                    &key,
+                    &sessions,
+                    timeout_duration,
+                )
+                .await;
 
-                // Validate and mangle the packet BEFORE creating a session:
-                // an invalid packet from an unknown source must not be able
-                // to allocate a session (socket + task) that lingers until
-                // it times out, or spoofed sources could exhaust resources.
-                let padding_len = match obfuscate(&mut buf[..], len, &key, is_client) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        error!("[Session {src_addr}] Failed to obfuscate packet: {e}");
-                        continue;
-                    }
-                };
-
-                // Fast path: reuse an existing session for this source.
-                let existing = sessions.read().await.get(&src_addr).cloned();
-                let proxy_socket = if let Some(socket) = existing {
-                    socket
-                } else {
-                    // New session: bind the proxy socket outside the lock so
-                    // we never await while holding the sessions lock (the
-                    // reverse-path cleanup task needs it to remove expired
-                    // sessions).
-                    let socket = match UdpSocket::bind("0.0.0.0:0").await {
-                        Ok(v) => Arc::new(v),
+                // Non-blocking drain: datagrams already queued behind the
+                // one above go through the same relay path in this
+                // iteration, so a burst costs one blocking recv plus a poll
+                // per packet instead of one blocking recv per packet.
+                for _ in 0..UDP_DRAIN_CAP {
+                    match listen_socket.try_recv_from(&mut buf) {
+                        Ok((len, src_addr)) => {
+                            debug!("listen socket: drained {len} bytes from {src_addr}");
+                            relay_udp_datagram(
+                                is_client,
+                                &listen_socket,
+                                forward_addr,
+                                src_addr,
+                                &mut buf,
+                                len,
+                                &key,
+                                &sessions,
+                                timeout_duration,
+                            )
+                            .await;
+                        }
                         Err(e) => {
-                            error!("[Session {src_addr}] can not create the forwarder_socket: {e}");
-                            // Keep serving the other clients on this worker.
-                            continue;
+                            if e.kind() != ErrorKind::WouldBlock {
+                                error!("listen_socket try_recv_from error: {e}");
+                            }
+                            break;
                         }
-                    };
-
-                    let mut guard = sessions.write().await;
-                    // NOTE: the forward loop is the only task that inserts
-                    // sessions (reverse-path tasks only remove), so a plain
-                    // get-then-insert is race-free here. Use the entry API if
-                    // a concurrent inserter is ever introduced.
-                    if let Some(socket) = guard.get(&src_addr) {
-                        socket.clone()
-                    } else {
-                        // Bound sessions so spoofed sources cannot exhaust
-                        // sockets and tasks: each session occupies a socket
-                        // and a task until the inactivity timeout.
-                        if guard.len() >= MAX_SESSIONS_PER_WORKER {
-                            error!(
-                                "[Session {src_addr}] Session limit ({MAX_SESSIONS_PER_WORKER}) reached; dropping packet"
-                            );
-                            continue;
-                        }
-
-                        info!("[Session {src_addr}] New connection established.");
-                        guard.insert(src_addr, socket.clone());
-
-                        {
-                            let listen_socket = listen_socket.clone();
-                            let key = key.clone();
-                            let sessions = sessions.clone();
-                            let forwarder_socket = socket.clone();
-                            spawn(async move {
-                                handle_forward_socket(
-                                    is_client,
-                                    listen_socket,
-                                    forwarder_socket,
-                                    src_addr,
-                                    &key,
-                                    sessions,
-                                    timeout_duration,
-                                )
-                                .await;
-                            });
-                        }
-
-                        socket
                     }
-                };
-
-                if let Err(e) = proxy_socket
-                    .send_to(&buf[..padding_len], forward_addr)
-                    .await
-                {
-                    error!("[Session {src_addr}] Failed to send_to packet: {e}");
-                    // The proxy socket is likely broken. Remove the session
-                    // so the next packet from this source binds a fresh
-                    // socket; the old reverse-path task keeps draining the
-                    // old socket until it times out, so upstream replies
-                    // already in flight are still forwarded in the meantime.
-                    sessions.write().await.remove(&src_addr);
                 }
             }
         });
@@ -1439,6 +1939,13 @@ mod tests {
             let partial_check = partial_pseudo(src, dst, ulen);
             let garbage = 1 + (rnd() % 0xfffe) as u16;
             for check in [full_check, partial_check, garbage] {
+                // A zero UDP checksum field means "no checksum" (RFC 768);
+                // the decode path deliberately leaves it untouched, so a
+                // fresh recompute cannot be expected. This is reachable for
+                // certain `ulen` (random padding), making the test flaky.
+                if check == 0 {
+                    continue;
+                }
                 let (out, new_check, new_dport) = ebpf_decode_mirror(
                     &buf[..encoded],
                     &key,
@@ -2018,11 +2525,7 @@ mod tests {
 
     /// Encode `wg` into a complete TCP frame and write it to `tx`.
     /// Returns the frame bytes (as `encode_tcp_frame` laid them out).
-    async fn push_frame(
-        tx: &mut tokio::io::DuplexStream,
-        wg: &[u8],
-        key: &Key,
-    ) -> Vec<u8> {
+    async fn push_frame(tx: &mut tokio::io::DuplexStream, wg: &[u8], key: &Key) -> Vec<u8> {
         let mut frame = vec![0u8; MAX_TCP_PAYLOAD + TCP_FRAME_HEADER_LEN];
         frame[TCP_FRAME_HEADER_LEN..TCP_FRAME_HEADER_LEN + wg.len()].copy_from_slice(wg);
         let frame_len = encode_tcp_frame(&mut frame, wg.len(), key).unwrap();
@@ -2085,9 +2588,7 @@ mod tests {
         // Pick a key index whose derived bytes at positions 3 and 6 differ
         // between the two keys (per-byte collision chance 2^-8 each).
         let mut index = 0usize;
-        while key_a.0[index][3] == key_b.0[index][3]
-            || key_a.0[index][6] == key_b.0[index][6]
-        {
+        while key_a.0[index][3] == key_b.0[index][3] || key_a.0[index][6] == key_b.0[index][6] {
             index += 1;
         }
         let index_bytes = (index as u16).to_le_bytes();
@@ -2108,15 +2609,16 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_frame_stream_round_trip() {
-        let (mut tx, mut rx) = tokio::io::duplex(4096);
+        let (mut tx, rx) = tokio::io::duplex(4096);
         let key = Key::new(TEST_KEY);
+        let mut fr = TcpFrameReader::new(rx);
 
         // A 32-byte keepalive data packet: the frame payload carries
         // 0..=31 bytes of random padding, which decode strips back to 32.
         let wg = wg_keepalive();
         let _ = push_frame(&mut tx, &wg, &key).await;
         let mut buf = vec![0u8; MAX_TCP_PAYLOAD];
-        let len = read_tcp_frame(&mut rx, &mut buf, &key).await.unwrap().unwrap();
+        let len = fr.next_frame(&mut buf, &key).await.unwrap().unwrap();
         assert!(len >= wg.len() && len <= wg.len() + KEEPALIVE_PAD_MAX);
         // The frame payload is the obfuscate-encoded datagram; decoding it
         // must recover the original WireGuard packet.
@@ -2128,7 +2630,7 @@ mod tests {
         // random padding, which decode strips back to 148.
         let wg2 = wg_handshake();
         let _ = push_frame(&mut tx, &wg2, &key).await;
-        let len = read_tcp_frame(&mut rx, &mut buf, &key).await.unwrap().unwrap();
+        let len = fr.next_frame(&mut buf, &key).await.unwrap().unwrap();
         assert!(len >= wg2.len() && len <= wg2.len() + 63);
         let wg_len = obfuscate(&mut buf[..], len, &key, false).unwrap();
         assert_eq!(wg_len, wg2.len());
@@ -2136,13 +2638,14 @@ mod tests {
 
         // A clean EOF at a frame boundary reads as None, not an error.
         drop(tx);
-        assert!(read_tcp_frame(&mut rx, &mut buf, &key).await.unwrap().is_none());
+        assert!(fr.next_frame(&mut buf, &key).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn tcp_frame_stream_partial_frames() {
-        let (mut tx, mut rx) = tokio::io::duplex(4096);
+        let (mut tx, rx) = tokio::io::duplex(4096);
         let key = Key::new(TEST_KEY);
+        let mut fr = TcpFrameReader::new(rx);
 
         // Two frames written byte-by-byte (any TCP fragmentation): the
         // stream reader must reassemble both exactly.
@@ -2155,16 +2658,165 @@ mod tests {
             }
         }
         let mut buf = vec![0u8; MAX_TCP_PAYLOAD];
-        let len = read_tcp_frame(&mut rx, &mut buf, &key).await.unwrap().unwrap();
+        let len = fr.next_frame(&mut buf, &key).await.unwrap().unwrap();
         let wg_len = obfuscate(&mut buf[..], len, &key, false).unwrap();
         assert_eq!(&buf[..wg_len], &wg_keepalive()[..]);
-        let len = read_tcp_frame(&mut rx, &mut buf, &key).await.unwrap().unwrap();
+        let len = fr.next_frame(&mut buf, &key).await.unwrap().unwrap();
         let wg_len = obfuscate(&mut buf[..], len, &key, false).unwrap();
         assert_eq!(&buf[..wg_len], &wg_keepalive()[..]);
 
         // EOF in the middle of a header counts as a clean close.
         tx.write_all(&[0x00]).await.unwrap();
         drop(tx);
-        assert!(read_tcp_frame(&mut rx, &mut buf, &key).await.unwrap().is_none());
+        assert!(fr.next_frame(&mut buf, &key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn tcp_frame_reader_large_frame() {
+        let (mut tx, rx) = tokio::io::duplex(65536);
+        let key = Key::new(TEST_KEY);
+        let mut fr = TcpFrameReader::new(rx);
+
+        // A data packet larger than TCP_READ_CHUNK exercises the direct-read
+        // path where the frame body overflows the reader buffer.
+        let mut wg = vec![0u8; TCP_READ_CHUNK + 4096];
+        wg[0] = 4; // data message type
+        let _ = push_frame(&mut tx, &wg, &key).await;
+
+        let mut buf = vec![0u8; MAX_TCP_PAYLOAD];
+        let len = fr.next_frame(&mut buf, &key).await.unwrap().unwrap();
+        let wg_len = obfuscate(&mut buf[..], len, &key, false).unwrap();
+        assert_eq!(wg_len, wg.len());
+        assert_eq!(&buf[..wg_len], &wg[..]);
+    }
+
+    #[test]
+    fn frame_pool_recycles_buffers() {
+        let pool = FramePool::new();
+        let a = pool.acquire();
+        assert_eq!(a.buf.len(), FRAME_CAP);
+        assert_eq!(a.len, 0);
+        let ptr = a.buf.as_ptr();
+        pool.release(a);
+        // The next acquire returns the same allocation, len reset.
+        let b = pool.acquire();
+        assert_eq!(b.buf.as_ptr(), ptr);
+        assert_eq!(b.buf.len(), FRAME_CAP);
+        assert_eq!(b.len, 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_write_batch_delivers_all_frames() {
+        let pool = FramePool::new();
+        let key = Key::new(TEST_KEY);
+        let (mut writer, reader) = tokio::io::duplex(65536);
+        let mut fr = TcpFrameReader::new(reader);
+
+        // Encode a few datagrams into pooled frames.
+        let dgs = [wg_keepalive(), wg_handshake(), wg_keepalive()];
+        let mut frames: Vec<Frame> = Vec::new();
+        for wg in &dgs {
+            let mut f = pool.acquire();
+            f.buf[TCP_FRAME_HEADER_LEN..TCP_FRAME_HEADER_LEN + wg.len()].copy_from_slice(wg);
+            f.len = encode_tcp_frame(&mut f.buf, wg.len(), &key).unwrap();
+            frames.push(f);
+        }
+
+        // One writev must deliver every frame intact over the stream.
+        write_frame_batch(&mut writer, &mut frames, &pool)
+            .await
+            .unwrap();
+        assert!(frames.is_empty(), "batch consumed");
+
+        let mut buf = vec![0u8; MAX_TCP_PAYLOAD];
+        for wg in &dgs {
+            let len = fr.next_frame(&mut buf, &key).await.unwrap().unwrap();
+            let wg_len = obfuscate(&mut buf[..], len, &key, false).unwrap();
+            assert_eq!(&buf[..wg_len], &wg[..]);
+        }
+
+        // Every batch buffer is back in the pool for reuse.
+        assert_eq!(pool.free.lock().unwrap().len(), dgs.len());
+    }
+
+    #[tokio::test]
+    async fn tcp_server_udp_drain_batches_queued_datagrams() {
+        let pool = FramePool::new();
+        let key = Key::new(TEST_KEY);
+
+        // A real loopback UDP pair: `udp` is the connected relay socket the
+        // server drains, `peer` plays the WireGuard daemon.
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.connect(peer.local_addr().unwrap()).await.unwrap();
+
+        let dgs = [wg_keepalive(), wg_handshake(), wg_keepalive()];
+        for wg in &dgs {
+            peer.send_to(wg, udp.local_addr().unwrap()).await.unwrap();
+        }
+
+        // Consume the first datagram with a blocking recv. tokio's `try_recv`
+        // only acts on the *cached* readiness bit, which a fresh socket does
+        // not have until a real recv/readable poll registers it -- exactly
+        // how the server's outbound loop works (first recv, then drain).
+        let mut first = vec![0u8; MAX_UDP_SIZE];
+        let n = udp.recv(&mut first).await.unwrap();
+        assert_eq!(&first[..n], &dgs[0][..]);
+
+        // The drain must pick up every remaining datagram, in order, encoded.
+        let batch = drain_udp_batch(&udp, &pool, &key, udp.local_addr().unwrap(), 4);
+        assert_eq!(
+            batch.len(),
+            dgs.len() - 1,
+            "remaining queued datagrams drained"
+        );
+
+        let mut payload = vec![0u8; MAX_TCP_PAYLOAD];
+        for (f, wg) in batch.iter().zip(&dgs[1..]) {
+            let payload_len = f.len - TCP_FRAME_HEADER_LEN;
+            payload[..payload_len].copy_from_slice(&f.buf[TCP_FRAME_HEADER_LEN..f.len]);
+            let wg_len = obfuscate(&mut payload[..], payload_len, &key, false).unwrap();
+            assert_eq!(&payload[..wg_len], &wg[..]);
+        }
+
+        // Nothing left queued after the drain.
+        assert!(drain_udp_batch(&udp, &pool, &key, udp.local_addr().unwrap(), 4).is_empty());
+    }
+
+    #[tokio::test]
+    async fn udp_forwarder_relays_datagram() {
+        let key = Key::new(TEST_KEY);
+        let listen_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let forward = match peer.local_addr().unwrap() {
+            SocketAddr::V4(v4) => v4,
+            _ => unreachable!(),
+        };
+        let sessions: Arc<RwLock<HashMap<SocketAddr, Arc<UdpSocket>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // A keepalive datagram relayed through a fresh (connected) proxy
+        // socket must arrive at the peer obfuscated and decode back to the
+        // original WireGuard packet.
+        let wg = wg_keepalive();
+        let mut buf = [0u8; MAX_UDP_SIZE];
+        buf[..wg.len()].copy_from_slice(&wg);
+        relay_udp_datagram(
+            true,
+            &listen_socket,
+            forward,
+            "127.0.0.1:1".parse().unwrap(),
+            &mut buf,
+            wg.len(),
+            &key,
+            &sessions,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        let mut rbuf = [0u8; MAX_UDP_SIZE];
+        let (n, _from) = peer.recv_from(&mut rbuf).await.unwrap();
+        let wg_len = obfuscate(&mut rbuf[..], n, &key, false).unwrap();
+        assert_eq!(&rbuf[..wg_len], &wg[..]);
     }
 }
