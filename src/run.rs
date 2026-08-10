@@ -12,8 +12,6 @@ use std::{
     time::Duration,
 };
 
-// `Ipv4Addr` is only referenced by the kernel-mode client fallback listen
-// address, so gate it behind the feature to keep default builds warning-free.
 #[cfg(feature = "kernel")]
 use std::net::Ipv4Addr;
 
@@ -29,22 +27,15 @@ use tokio::{
 
 use crate::ForwarderArgs;
 
-// `kernel` is declared as a crate-root module in main.rs (src/kernel.rs).
 #[cfg(feature = "kernel")]
 use crate::kernel;
 
-const MAX_UDP_SIZE: usize = u16::MAX as usize;
 // Largest possible UDP payload: 65535 bytes - 20 (IP header) - 8 (UDP header).
 const MAX_UDP_PAYLOAD: usize = u16::MAX as usize - 28;
-// Per-worker cap on concurrent sessions. Each session holds a socket and a
-// task until the inactivity timeout, so unbounded sessions would let
-// spoofed sources exhaust file descriptors.
+const RECV_BUF_SIZE: usize = 2048;
 const MAX_SESSIONS_PER_WORKER: usize = 256;
 pub const DERIVED_KEY_NUM: usize = 64;
 const DERIVED_KEY_LEN: usize = 8;
-// The standard WireGuard listen port; assumed on the kernel-mode server when
-// `--forward` is omitted (matches `wg-quick`'s default). Used only by the
-// `kernel` feature's `run_kernel`.
 #[cfg(feature = "kernel")]
 const DEFAULT_WG_PORT: u16 = 51820;
 
@@ -66,10 +57,11 @@ const KEEPALIVE_PAD_MAX: usize = 64;
 const KEEPALIVE_PAD_BIT: u8 = 0x80;
 
 fn obfuscate(packet: &mut [u8], len: usize, key: &Key, is_encode: bool) -> Result<usize> {
-    // NOTE: `packet` is the full scratch buffer (MAX_UDP_SIZE bytes) and
-    // `len` is the actual datagram length, so all bounds checks below must
-    // use `len`. Bytes past `len` hold stale data from previous datagrams
-    // and must never be read, transformed, or forwarded.
+    // NOTE: `packet` is the full scratch buffer (its capacity is the caller's
+    // receive buffer) and `len` is the actual datagram length, so all bounds
+    // checks below must use `len`, and every write past `len` (padding) is
+    // capped at `packet.len()`. Bytes past `len` hold stale data from previous
+    // datagrams and must never be read, transformed, or forwarded.
     if len < 4 {
         bail!("packet too short: {len} bytes");
     }
@@ -90,9 +82,9 @@ fn obfuscate(packet: &mut [u8], len: usize, key: &Key, is_encode: bool) -> Resul
         let used_key = key.get(&packet[..2])?;
         let mut kbidx = packet[2];
         let data_pad = if message_type == 4 && len == 32 {
-            // Cap so `len + pad` never exceeds the UDP payload limit.
+            // Cap so `len + pad` never exceeds the scratch buffer.
             let pad = (((rnd >> 32) as u8 % (KEEPALIVE_PAD_MAX as u8 + 1)) as usize)
-                .min(MAX_UDP_PAYLOAD.saturating_sub(len));
+                .min(packet.len().saturating_sub(len));
             // Padded keepalive: bit 7 = 0.
             kbidx &= !KEEPALIVE_PAD_BIT;
             packet[2] = kbidx;
@@ -162,9 +154,7 @@ fn obfuscate(packet: &mut [u8], len: usize, key: &Key, is_encode: bool) -> Resul
                 let mut rnd = [0u8; 64];
                 getrandom::fill(&mut rnd)?;
                 let padding_size = (rnd[0] % 64) as usize;
-                // Cap at the real UDP payload limit (65507 bytes); anything
-                // larger would fail in send_to with EMSGSIZE.
-                let padding_len = (len + padding_size).min(MAX_UDP_PAYLOAD);
+                let padding_len = (len + padding_size).min(packet.len());
                 // XOR only the bytes that will actually be sent (the real
                 // packet plus the padding region); the rest of the scratch
                 // buffer holds stale data and must not be touched.
@@ -338,7 +328,7 @@ async fn handle_forward_socket(
     sessions: Arc<RwLock<HashMap<SocketAddr, Arc<UdpSocket>>>>,
     timeout_duration: Duration,
 ) {
-    let mut buf = [0u8; MAX_UDP_SIZE];
+    let mut buf = [0u8; RECV_BUF_SIZE];
     'session: loop {
         match tokio::time::timeout(timeout_duration, proxy_socket.recv(&mut buf)).await {
             Ok(Ok(len)) => {
@@ -1521,7 +1511,7 @@ async fn run_forwarder(args: ForwarderArgs, is_client: bool) -> Result<()> {
             let sessions: Arc<RwLock<HashMap<_, Arc<UdpSocket>>>> =
                 Arc::new(RwLock::new(HashMap::new()));
 
-            let mut buf = [0u8; MAX_UDP_SIZE];
+            let mut buf = [0u8; RECV_BUF_SIZE];
 
             loop {
                 let (len, src_addr) = match listen_socket.recv_from(&mut buf).await {
@@ -1586,6 +1576,7 @@ async fn run_forwarder(args: ForwarderArgs, is_client: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    const MAX_UDP_SIZE: usize = u16::MAX as usize;
     const TEST_KEY: [u8; 32] = [7u8; 32];
 
     fn test_packet(msg_type: u8, size: usize) -> ([u8; MAX_UDP_SIZE], [u8; MAX_UDP_SIZE]) {
