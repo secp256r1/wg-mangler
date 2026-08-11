@@ -113,38 +113,27 @@ fn obfuscate(packet: &mut [u8], len: usize, key: &Key, is_encode: bool) -> Resul
     Ok(match message_type {
         // data
         4 => {
+            // Every path below operates on the same 12-byte window and
+            // rejects truncated packets the same way; only the return
+            // length differs.
+            if len < 16 {
+                bail!("truncated data packet: {len} bytes");
+            }
+
+            xor_transform(&mut packet[4..16], used_key);
             if is_encode {
-                if len < 16 {
-                    bail!("truncated data packet: {len} bytes");
-                }
-                xor_transform(&mut packet[4..16], used_key);
-                // Only keepalives (exactly 32 bytes) are padded.
-                let padding_len = if len == 32 { len + data_pad } else { len };
-                getrandom::fill(&mut packet[len..padding_len])?;
-                padding_len
-            } else if is_keepalive_pad {
-                // Padded keepalive: the pad length is inferred from the
-                // wire length (the flag in packet[2] is the marker).
-                if (32..=32 + KEEPALIVE_PAD_MAX).contains(&len) {
-                    xor_transform(&mut packet[4..16], used_key);
-                    32
+                // `is_keepalive_pad` is always false on encode, so the
+                // keepalive branch below is decode-only.
+                if len == 32 {
+                    let padding_len = len + data_pad;
+                    getrandom::fill(&mut packet[len..padding_len])?;
+                    padding_len
                 } else {
-                    // Flagged as keepalive but outside the valid length
-                    // range: not a padded keepalive from a current peer
-                    // (e.g. a plain data packet from an older peer whose
-                    // packet[2] bit 7 is random). Pass it through
-                    // untouched instead of dropping it.
-                    if len < 16 {
-                        bail!("truncated data packet: {len} bytes");
-                    }
-                    xor_transform(&mut packet[4..16], used_key);
                     len
                 }
+            } else if is_keepalive_pad && len >= 32 {
+                32
             } else {
-                if len < 16 {
-                    bail!("truncated data packet: {len} bytes");
-                }
-                xor_transform(&mut packet[4..16], used_key);
                 len
             }
         }
