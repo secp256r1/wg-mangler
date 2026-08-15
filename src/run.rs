@@ -38,6 +38,12 @@ pub const DERIVED_KEY_NUM: usize = 64;
 const DERIVED_KEY_LEN: usize = 8;
 #[cfg(feature = "kernel")]
 const DEFAULT_WG_PORT: u16 = 51820;
+/// Bit 7 of packet[2] (the key-byte index) marks data padding presence:
+/// 0 = padded keepalive, 1 = plain data packet. The pad length is inferred
+/// from the wire length (pad = len - 32), so this single flag is all the
+/// decoder needs. Using only the top bit keeps the rest of packet[2]
+/// random, so the byte's distribution stays wide (128 values per class).
+const KEEPALIVE_PAD_BIT: u8 = 0x80;
 
 #[inline]
 fn xor_transform(data: &mut [u8], key: &[u8; 8]) {
@@ -45,16 +51,6 @@ fn xor_transform(data: &mut [u8], key: &[u8; 8]) {
         *byte ^= key[i % key.len()];
     }
 }
-
-/// Maximum padding appended to a 32-byte keepalive data packet (0..=64
-/// random bytes, so a padded keepalive lands in [32, 96] on the wire).
-const KEEPALIVE_PAD_MAX: usize = 64;
-/// Bit 7 of packet[2] (the key-byte index) marks data padding presence:
-/// 0 = padded keepalive, 1 = plain data packet. The pad length is inferred
-/// from the wire length (pad = len - 32), so this single flag is all the
-/// decoder needs. Using only the top bit keeps the rest of packet[2]
-/// random, so the byte's distribution stays wide (128 values per class).
-const KEEPALIVE_PAD_BIT: u8 = 0x80;
 
 fn obfuscate(packet: &mut [u8], len: usize, key: &Key, is_encode: bool) -> Result<usize> {
     // NOTE: `packet` is the full scratch buffer (its capacity is the caller's
@@ -66,48 +62,26 @@ fn obfuscate(packet: &mut [u8], len: usize, key: &Key, is_encode: bool) -> Resul
         bail!("packet too short: {len} bytes");
     }
 
-    // Padding appended by the encode path to data keepalive packets
-    // (exactly 32 bytes): 0..=64 random bytes. Bit 7 of the key-byte
-    // index (packet[2]) is cleared to mark the padded keepalive, and the
-    // pad length is inferred from the wire length. The low 3 bits still
-    // select the derived-key byte for the type mask (`Key::get_key_byte`
-    // uses `index % 8`). Non-keepalive data packets set bit 7 so the
-    // decoder can never confuse them with a padded keepalive. Handshakes
-    // are unchanged (their padding is implied by the fixed canonical
-    // sizes, and packet[2] stays fully random).
-    let (message_type, used_key, data_pad, is_keepalive_pad) = if is_encode {
+    let (message_type, used_key, is_keepalive_pad) = if is_encode {
         let message_type = packet[0];
-        let rnd = getrandom::u64()?;
-        packet[0..4].copy_from_slice(&(rnd as u32).to_le_bytes());
+        getrandom::fill(&mut packet[0..4])?;
         let used_key = key.get(&packet[..2])?;
-        let mut kbidx = packet[2];
-        let data_pad = if message_type == 4 && len == 32 {
-            // Cap so `len + pad` never exceeds the scratch buffer.
-            let pad = (((rnd >> 32) as u8 % (KEEPALIVE_PAD_MAX as u8 + 1)) as usize)
-                .min(packet.len().saturating_sub(len));
-            // Padded keepalive: bit 7 = 0.
-            kbidx &= !KEEPALIVE_PAD_BIT;
-            packet[2] = kbidx;
-            pad
+        let is_keepalive_pad = if message_type == 4 && len == 32 {
+            packet[2] &= !KEEPALIVE_PAD_BIT;
+            true
         } else {
-            // Non-keepalive data: bit 7 = 1 marks "no padding".
-            if message_type == 4 {
-                kbidx |= KEEPALIVE_PAD_BIT;
-                packet[2] = kbidx;
-            }
-            0
+            packet[2] |= KEEPALIVE_PAD_BIT;
+            false
         };
-        packet[3] = message_type ^ Key::get_key_byte(used_key, kbidx);
-        (message_type, used_key, data_pad, false)
+        packet[3] = message_type ^ Key::get_key_byte(used_key, packet[2]);
+        (message_type, used_key, is_keepalive_pad)
     } else {
         let used_key = key.get(&packet[..2])?;
         let message_type = packet[3] ^ Key::get_key_byte(used_key, packet[2]);
-        // Capture the keepalive flag before the header is cleared.
-        let is_keepalive_pad = message_type == 4 && (packet[2] & KEEPALIVE_PAD_BIT) == 0;
-
         packet[0] = message_type;
+        let is_keepalive_pad = message_type == 4 && (packet[2] & KEEPALIVE_PAD_BIT) == 0;
         packet[1..4].fill(0);
-        (message_type, used_key, 0, is_keepalive_pad)
+        (message_type, used_key, is_keepalive_pad)
     };
 
     Ok(match message_type {
@@ -121,18 +95,16 @@ fn obfuscate(packet: &mut [u8], len: usize, key: &Key, is_encode: bool) -> Resul
             }
 
             xor_transform(&mut packet[4..16], used_key);
-            if is_encode {
-                // `is_keepalive_pad` is always false on encode, so the
-                // keepalive branch below is decode-only.
-                if len == 32 {
-                    let padding_len = len + data_pad;
+            if is_keepalive_pad {
+                if is_encode {
+                    let padding_len = (len + getrandom::u32()? as u8 as usize).min(packet.len());
                     getrandom::fill(&mut packet[len..padding_len])?;
                     padding_len
+                } else if len >= 32 && len <= 32 + u8::MAX as usize {
+                    32
                 } else {
                     len
                 }
-            } else if is_keepalive_pad && len >= 32 {
-                32
             } else {
                 len
             }
@@ -144,10 +116,11 @@ fn obfuscate(packet: &mut [u8], len: usize, key: &Key, is_encode: bool) -> Resul
                 getrandom::fill(&mut rnd)?;
                 let padding_size = (rnd[0] % 64) as usize;
                 let padding_len = (len + padding_size).min(packet.len());
-                // XOR only the bytes that will actually be sent (the real
-                // packet plus the padding region); the rest of the scratch
-                // buffer holds stale data and must not be touched.
-                xor_transform(&mut packet[4..padding_len], used_key);
+                // XOR only the real packet bytes (the padding region is
+                // overwritten with random data immediately after, so XORing
+                // it would be wasted work); the rest of the scratch buffer
+                // holds stale data and must not be touched.
+                xor_transform(&mut packet[4..len], used_key);
                 let pad = padding_len - len;
                 packet[len..padding_len].copy_from_slice(&rnd[1..1 + pad]);
                 padding_len
@@ -1178,10 +1151,11 @@ async fn server_tcp_session(
     // Inbound path: TCP frames from the client -> UDP to the WG daemon.
     // `closed_tx` drops (and so wakes the outbound select below) whenever
     // this task exits for any reason.
-    let (_closed_tx, mut closed_rx) = tokio::sync::watch::channel(false);
+    let (closed_tx, mut closed_rx) = tokio::sync::watch::channel(false);
     let udp_in = udp.clone();
     let key_in = key.clone();
     let reader_task = spawn(async move {
+        let _closed_tx = closed_tx;
         // The buffered frame reader coalesces back-to-back frames into one
         // `read` syscall per chunk.
         let mut frame_reader = TcpFrameReader::new(reader);
@@ -1648,7 +1622,7 @@ mod tests {
         let (mut buf, original) = test_packet(4, 32);
         let encoded = obfuscate(&mut buf[..], 32, &key, true).unwrap();
         assert!(
-            (32..=32 + KEEPALIVE_PAD_MAX).contains(&encoded),
+            (32..=32 + u8::MAX as usize).contains(&encoded),
             "unexpected data encoded length {encoded}"
         );
         let decoded = obfuscate(&mut buf[..], encoded, &key, false).unwrap();
@@ -1760,7 +1734,7 @@ mod tests {
     fn data_decode_drops_padding() {
         let key = Key::new(TEST_KEY);
 
-        // Data padding is random (0..=31); encode until we get a padded
+        // Data padding is random (0..=255); encode until we get a padded
         // keepalive (the length is no longer a fixed 32 bytes).
         let (mut buf, original, encoded) = loop {
             let (mut buf, original) = test_packet(4, 32);
@@ -1800,17 +1774,17 @@ mod tests {
     #[test]
     fn keepalive_flag_out_of_range_passes_through() {
         let key = Key::new(TEST_KEY);
-        // A 112-byte data packet whose packet[2] bit 7 happens to be 0
+        // A 300-byte data packet whose packet[2] bit 7 happens to be 0
         // (e.g. from an older peer that does not set the flag). It must be
         // passed through untouched, not treated as a padded keepalive
-        // (which can only be 32..=96 bytes) and not dropped.
-        let (mut buf, original) = test_packet(4, 112);
-        let encoded = obfuscate(&mut buf[..], 112, &key, true).unwrap();
-        assert_eq!(encoded, 112);
+        // (which can only be 32..=287 bytes) and not dropped.
+        let (mut buf, original) = test_packet(4, 300);
+        let encoded = obfuscate(&mut buf[..], 300, &key, true).unwrap();
+        assert_eq!(encoded, 300);
         buf[2] &= 0x7f; // clear bit 7, as an older peer's packet would
-        let decoded = obfuscate(&mut buf[..], 112, &key, false).unwrap();
-        assert_eq!(decoded, 112);
-        assert_eq!(buf[..112], original[..112]);
+        let decoded = obfuscate(&mut buf[..], 300, &key, false).unwrap();
+        assert_eq!(decoded, 300);
+        assert_eq!(buf[..300], original[..300]);
     }
 
     // Verifying the kernel checksum math─────────────────
@@ -2213,7 +2187,7 @@ mod tests {
         } else if msg_type == 4
             && (kbidx & KEEPALIVE_PAD_BIT) == 0
             && wire_len >= 32
-            && wire_len <= 32 + KEEPALIVE_PAD_MAX
+            && wire_len <= 32 + u8::MAX as usize
         {
             // Userspace keepalive padding: bit 7 of packet[2] is 0 and the
             // pad length is inferred from the wire length.
@@ -2644,7 +2618,7 @@ mod tests {
         let _ = push_frame(&mut tx, &wg, &key).await;
         let mut buf = vec![0u8; MAX_TCP_PAYLOAD];
         let len = fr.next_frame(&mut buf, &key).await.unwrap().unwrap();
-        assert!(len >= wg.len() && len <= wg.len() + KEEPALIVE_PAD_MAX);
+        assert!(len >= wg.len() && len <= wg.len() + u8::MAX as usize);
         // The frame payload is the obfuscate-encoded datagram; decoding it
         // must recover the original WireGuard packet.
         let wg_len = obfuscate(&mut buf[..], len, &key, false).unwrap();

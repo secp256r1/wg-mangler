@@ -85,11 +85,11 @@ const MAX_VLAN_TAGS: usize = 2;
 const SNAP: usize = 160;
 /// Upstream (userspace) peers pad handshakes by at most 63 bytes.
 const MAX_PAD: u32 = 64;
-/// Data keepalives (32 bytes) get 0..=64 random padding from userspace;
+/// Data keepalives (32 bytes) get 0..=255 random padding from userspace;
 /// bit 7 of the key-byte index (packet[2]) marks padding presence:
 /// 0 = padded keepalive, 1 = plain data packet. The pad length is inferred
 /// from the wire length (pad = len - 32).
-const KEEPALIVE_PAD_MAX: u32 = 64;
+const KEEPALIVE_PAD_MAX: u32 = u8::MAX as u32;
 const KEEPALIVE_PAD_BIT: u8 = 0x80;
 
 /// 64 derived 8-byte keys (index = LE bytes 0-1 of the header).
