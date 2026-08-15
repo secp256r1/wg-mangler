@@ -4,7 +4,7 @@
 use std::{
     collections::HashMap,
     io::{ErrorKind, IoSlice},
-    net::{SocketAddr, SocketAddrV4},
+    net::SocketAddr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -13,7 +13,7 @@ use std::{
 };
 
 #[cfg(feature = "kernel")]
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 use anyhow::{Result, bail};
 use log::{debug, error, info};
@@ -169,8 +169,21 @@ fn obfuscate(packet: &mut [u8], len: usize, key: &Key, is_encode: bool) -> Resul
     })
 }
 
-fn new_reuseport_udp_socket(addr: SocketAddrV4) -> Result<UdpSocket> {
-    let udp_sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
+fn new_reuseport_udp_socket(addr: SocketAddr) -> Result<UdpSocket> {
+    let udp_sock = socket2::Socket::new(
+        match addr {
+            SocketAddr::V4(_) => socket2::Domain::IPV4,
+            SocketAddr::V6(_) => socket2::Domain::IPV6,
+        },
+        socket2::Type::DGRAM,
+        None,
+    )?;
+    if let SocketAddr::V6(_) = addr {
+        // Bind `[::]:port` as IPv6-only so it can neither silently receive
+        // v4-mapped datagrams nor collide with a v4 listener on the same
+        // port under SO_REUSEPORT.
+        udp_sock.set_only_v6(true)?;
+    }
     #[cfg(not(windows))]
     {
         // SO_REUSEADDR + SO_REUSEPORT together: REUSEPORT allows several
@@ -199,8 +212,14 @@ fn new_reuseport_udp_socket(addr: SocketAddrV4) -> Result<UdpSocket> {
 /// (`forward_addr`), which always replies from that address (the remote
 /// mangler's SO_REUSEPORT workers all share `forward_addr`, and the local
 /// WireGuard daemon replies from its own bound address).
-async fn new_proxy_socket(forward_addr: SocketAddrV4) -> Result<Arc<UdpSocket>> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+async fn new_proxy_socket(forward_addr: SocketAddr) -> Result<Arc<UdpSocket>> {
+    // Bind an ephemeral socket of the peer's address family, so a v4 peer
+    // gets a v4 proxy socket and a v6 peer a v6 one.
+    let bind_addr = match forward_addr {
+        SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+        SocketAddr::V6(_) => SocketAddr::from(([0; 16], 0)),
+    };
+    let socket = UdpSocket::bind(bind_addr).await?;
     socket.connect(forward_addr).await?;
     if let Err(e) = socket2::SockRef::from(&socket).set_recv_buffer_size(UDP_RCVBUF) {
         debug!("set_recv_buffer_size failed: {e}");
@@ -217,7 +236,7 @@ async fn new_proxy_socket(forward_addr: SocketAddrV4) -> Result<Arc<UdpSocket>> 
 async fn relay_udp_datagram(
     is_client: bool,
     listen_socket: &Arc<UdpSocket>,
-    forward_addr: SocketAddrV4,
+    forward_addr: SocketAddr,
     src_addr: SocketAddr,
     buf: &mut [u8],
     len: usize,
@@ -762,7 +781,7 @@ fn drain_udp_batch(
 async fn route_tcp_frame(
     src_addr: SocketAddr,
     frame: Frame,
-    forward: SocketAddrV4,
+    forward: SocketAddr,
     listen_socket: &Arc<UdpSocket>,
     sessions: &TcpSessions,
     timeout_duration: Duration,
@@ -827,8 +846,20 @@ async fn route_tcp_frame(
     }
 }
 
-fn new_reuseport_tcp_listener(addr: SocketAddrV4) -> Result<TcpListener> {
-    let tcp_sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
+fn new_reuseport_tcp_listener(addr: SocketAddr) -> Result<TcpListener> {
+    let tcp_sock = socket2::Socket::new(
+        match addr {
+            SocketAddr::V4(_) => socket2::Domain::IPV4,
+            SocketAddr::V6(_) => socket2::Domain::IPV6,
+        },
+        socket2::Type::STREAM,
+        None,
+    )?;
+    if let SocketAddr::V6(_) = addr {
+        // Same reasoning as the UDP listener: keep the IPv6 listener from
+        // silently accepting v4-mapped connections.
+        tcp_sock.set_only_v6(true)?;
+    }
     #[cfg(not(windows))]
     {
         // SO_REUSEADDR lets a restarted server rebind while previous
@@ -857,7 +888,7 @@ fn new_reuseport_tcp_listener(addr: SocketAddrV4) -> Result<TcpListener> {
 #[allow(clippy::too_many_arguments)]
 async fn client_tcp_session(
     src_addr: SocketAddr,
-    forward: SocketAddrV4,
+    forward: SocketAddr,
     listen_socket: Arc<UdpSocket>,
     mut rx: mpsc::UnboundedReceiver<Frame>,
     session_tx: TcpSessionSender,
@@ -976,8 +1007,8 @@ async fn client_tcp_session(
 /// TCP client: binds a local UDP port (where the WireGuard peer points)
 /// and opens one TCP connection per WireGuard source socket to the server.
 async fn run_tcp_client(
-    listen: SocketAddrV4,
-    forward: SocketAddrV4,
+    listen: SocketAddr,
+    forward: SocketAddr,
     timeout_duration: Duration,
     key: Key,
 ) -> Result<()> {
@@ -1105,12 +1136,18 @@ async fn run_tcp_client(
 async fn server_tcp_session(
     stream: TcpStream,
     peer: SocketAddr,
-    forward: SocketAddrV4,
+    forward: SocketAddr,
     timeout_duration: Duration,
     key: Key,
     pool: FramePool,
 ) {
-    let udp = match UdpSocket::bind("0.0.0.0:0").await {
+    // Bind an ephemeral relay socket of the WG daemon's address family.
+    let udp = match UdpSocket::bind(match forward {
+        SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+        SocketAddr::V6(_) => SocketAddr::from(([0; 16], 0)),
+    })
+    .await
+    {
         Ok(v) => Arc::new(v),
         Err(e) => {
             error!("[Session {peer}] can not create the forwarder socket: {e}");
@@ -1249,8 +1286,8 @@ async fn server_tcp_session(
 /// TCP server: listens on the public TCP port and accepts one tunnel
 /// connection per WireGuard source.
 async fn run_tcp_server(
-    listen: SocketAddrV4,
-    forward: SocketAddrV4,
+    listen: SocketAddr,
+    forward: SocketAddr,
     timeout_duration: Duration,
     key: Key,
 ) -> Result<()> {
@@ -1423,8 +1460,13 @@ pub async fn run_dispatch(args: ForwarderArgs, is_client: bool) -> Result<()> {
 async fn run_kernel(args: ForwarderArgs, is_client: bool) -> Result<()> {
     let forward_v4 = match args.forward {
         // Explicit `--forward` (both roles): clap already parsed and
-        // resolved it (`IP:port` or `domain:port`, always IPv4).
-        Some(addr) => addr,
+        // resolved it (`IP:port` or `domain:port`). The eBPF programs
+        // match IPv4 addresses only, so IPv6 endpoints are rejected.
+        Some(SocketAddr::V4(v4)) => v4,
+        Some(SocketAddr::V6(_)) => bail!(
+            "kernel eBPF mode requires an IPv4 --forward (the eBPF programs \
+             match IPv4 addresses only)"
+        ),
         // Kernel server without `--forward`: the WireGuard daemon runs on
         // this host, so only its listen port is used (the XDP decode rewrites
         // the dst port of matching packets onto it; the remote IP is not used
@@ -1445,11 +1487,16 @@ async fn run_kernel(args: ForwarderArgs, is_client: bool) -> Result<()> {
         ),
     };
 
-    let listen = args.listen.unwrap_or_else(|| {
+    let listen = match args.listen {
+        Some(SocketAddr::V4(v4)) => v4,
+        Some(SocketAddr::V6(_)) => bail!(
+            "kernel eBPF mode requires an IPv4 --listen (the eBPF programs \
+             match IPv4 addresses only)"
+        ),
         // Client in kernel mode: unused (no local bind, interface is picked
         // from the route to the peer). Provide a placeholder.
-        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)
-    });
+        None => SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+    };
     kernel::run_kernel_ebpf(
         listen,
         forward_v4,
@@ -1497,9 +1544,7 @@ async fn run_forwarder(args: ForwarderArgs, is_client: bool) -> Result<()> {
                 }
             };
             let listen_socket = Arc::new(listen_socket);
-            let sessions: Arc<RwLock<HashMap<_, Arc<UdpSocket>>>> =
-                Arc::new(RwLock::new(HashMap::new()));
-
+            let sessions = Arc::new(RwLock::new(HashMap::new()));
             let mut buf = [0u8; RECV_BUF_SIZE];
 
             loop {
@@ -2768,10 +2813,7 @@ mod tests {
         let key = Key::new(TEST_KEY);
         let listen_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let forward = match peer.local_addr().unwrap() {
-            SocketAddr::V4(v4) => v4,
-            _ => unreachable!(),
-        };
+        let forward = peer.local_addr().unwrap();
         let sessions: Arc<RwLock<HashMap<SocketAddr, Arc<UdpSocket>>>> =
             Arc::new(RwLock::new(HashMap::new()));
 

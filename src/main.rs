@@ -1,5 +1,5 @@
 use std::{
-    net::{SocketAddr, SocketAddrV4, ToSocketAddrs},
+    net::{SocketAddr, ToSocketAddrs},
     str::FromStr,
 };
 
@@ -38,49 +38,64 @@ fn parse_key(s: &str) -> Result<[u8; 32]> {
         })
 }
 
-/// Parse a forward address: `IP:port` literals are validated exactly as
-/// before, and `domain:port` values are resolved to the first IPv4 address
-/// the hostname resolves to. Resolution runs once at parse time (before any
+/// Parse a forward address: `IP:port` and `[IPv6]:port` literals are
+/// validated exactly as before, and `domain:port` values are resolved to
+/// the hostname's first IPv4 address (or its first IPv6 address when no
+/// A record exists). Resolution runs once at parse time (before any
 /// subcommand runs), the same way clap's `value_parser` treats `--key`.
-fn parse_forward(s: &str) -> Result<SocketAddrV4> {
-    // Fast path: plain IPv4 literal, identical to clap's built-in
-    // `SocketAddrV4` parser that the field used before.
-    if let Ok(addr) = SocketAddrV4::from_str(s) {
+fn parse_forward(s: &str) -> Result<SocketAddr> {
+    // Fast path: plain IP literal (v4 or v6), identical to clap's built-in
+    // `SocketAddr` parser that the field used before.
+    if let Ok(addr) = SocketAddr::from_str(s) {
         return Ok(addr);
     }
 
-    // Otherwise treat it as `host:port` and resolve the hostname to IPv4.
+    // Otherwise treat it as `host:port` and resolve the hostname.
     let (host, port) = s.rsplit_once(':').ok_or_else(|| {
-        anyhow!("invalid forward address `{s}`: expected `IP:port` or `domain:port`")
+        anyhow!(
+            "invalid forward address `{s}`: expected `IP:port`, `[IPv6]:port`, or `domain:port`"
+        )
     })?;
+    // An unbracketed colon past the literal fast path is a malformed IPv6
+    // literal (e.g. `::1:80`); reject it instead of handing a colon-laden
+    // host to the resolver.
+    if host.contains(':') {
+        return Err(anyhow!(
+            "invalid forward address `{s}`: IPv6 literals must be bracketed, e.g. `[::1]:51820`"
+        ));
+    }
     let port: u16 = port
         .parse()
         .map_err(|e| anyhow!("invalid port in `{s}`: {e}"))?;
-    let addrs = (host, port)
+    let addrs: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
-        .map_err(|e| anyhow!("failed to resolve `{host}`: {e}"))?;
+        .map_err(|e| anyhow!("failed to resolve `{host}`: {e}"))?
+        .collect();
 
+    // Prefer IPv4 so dual-stack hostnames resolve deterministically (most
+    // hostnames carry A records, and `localhost` must not flip to `::1`
+    // between runs), falling back to the first IPv6 address for AAAA-only
+    // hosts.
     addrs
-        .into_iter()
-        .find_map(|addr| match addr {
-            SocketAddr::V4(v4) => Some(v4),
-            SocketAddr::V6(_) => None, // IPv6-only resolution is not usable here
-        })
-        .ok_or_else(|| anyhow!("`{host}` resolved to no IPv4 address"))
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| addrs.iter().find(|a| a.is_ipv6()))
+        .copied()
+        .ok_or_else(|| anyhow!("`{host}` resolved to no usable addresses"))
 }
 
 #[derive(Args)]
 pub struct ForwarderArgs {
-    /// Local listen address.
+    /// Local listen address (`IP:port` or `[IPv6]:port`).
     /// Required for the server, and for the client when running the userspace
     /// proxy (the WireGuard endpoint points here). Unused in kernel mode
     /// (client with `--kernel`), where the transform runs on the wire.
     #[arg(long, short)]
-    pub listen: Option<SocketAddrV4>,
+    pub listen: Option<SocketAddr>,
 
-    /// Forward address (`IP:port` or `domain:port`; hostnames are resolved
-    /// to their first IPv4 address at parse time, before any subcommand
-    /// runs).
+    /// Forward address (`IP:port`, `[IPv6]:port`, or `domain:port`; hostnames
+    /// are resolved to their first IPv4 address — or first IPv6 when no
+    /// A record exists — at parse time, before any subcommand runs).
     /// Required in userspace mode (the proxy's remote endpoint, and for the
     /// server the local WireGuard daemon) and for the kernel client (the
     /// peer's mangler endpoint, which supplies the ports/IP matched on the
@@ -88,7 +103,7 @@ pub struct ForwarderArgs {
     /// listen port is used, defaulting to the standard WG port (51820)
     /// when omitted.
     #[arg(long, short, value_parser = parse_forward)]
-    pub forward: Option<SocketAddrV4>,
+    pub forward: Option<SocketAddr>,
 
     #[arg(long, short, value_parser = parse_key)]
     pub key: [u8; 32],
@@ -143,11 +158,18 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddrV4;
 
     #[test]
     fn parse_forward_accepts_ipv4_literal() {
         let addr = parse_forward("1.2.3.4:51820").unwrap();
-        assert_eq!(addr, "1.2.3.4:51820".parse::<SocketAddrV4>().unwrap());
+        assert_eq!(addr, "1.2.3.4:51820".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn parse_forward_accepts_ipv6_literal() {
+        let addr = parse_forward("[::1]:51820").unwrap();
+        assert_eq!(addr, "[::1]:51820".parse::<SocketAddr>().unwrap());
     }
 
     #[test]
@@ -155,7 +177,10 @@ mod tests {
         // `localhost` resolves via the hosts file on every platform, no
         // network required.
         let addr = parse_forward("localhost:8080").unwrap();
-        assert_eq!(addr, SocketAddrV4::new("127.0.0.1".parse().unwrap(), 8080));
+        assert_eq!(
+            addr,
+            SocketAddr::V4(SocketAddrV4::new("127.0.0.1".parse().unwrap(), 8080))
+        );
     }
 
     #[test]
@@ -165,7 +190,7 @@ mod tests {
         assert!(parse_forward("1.2.3.4").is_err());
         // non-numeric port
         assert!(parse_forward("example.com:notaport").is_err());
-        // IPv6-only resolution must not silently fall into a v4 frame
+        // unbracketed IPv6 literal must not silently resolve
         assert!(parse_forward("::1:80").is_err());
         // empty string
         assert!(parse_forward("").is_err());
