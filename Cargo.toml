@@ -15,7 +15,18 @@ default = []
 kernel = ["dep:aya"]
 
 [dependencies]
-tokio = { version = "1.53.1", features = ["full"] }
+# compio replaces tokio as the async runtime. Default features provide the
+# runtime + io-uring backend; on non-Linux the io-uring feature is a no-op
+# and the polling (epoll/kqueue) backend is used instead. `polling` enables
+# the fusion driver, which falls back to epoll when io_uring is unavailable
+# (old kernels, restricted containers) instead of failing at startup.
+compio = { version = "0.19", features = ["net", "time", "signal", "macros", "io", "sync", "polling"] }
+# flume replaces tokio's mpsc/watch channels (compio itself depends on it).
+flume = "0.11"
+# future::select + pin_mut! replace the single tokio::select! usage.
+futures-util = "0.3"
+# FIONREAD ioctl for the non-blocking UDP drains (compio has no try_recv).
+libc = "0.2"
 clap = { version = "4.6.5", default-features = false, features = ["std", "derive", "help"] }
 anyhow = "1.0.104"
 log = "0.4.33"
@@ -26,6 +37,11 @@ env_logger = { version = "0.11.11", default-features = false }
 getrandom = { version = "0.4.3", features = ["std"] }
 sha2 = "0.11"
 aya = { version = "0.14", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# ioctlsocket(FIONREAD) for the non-blocking UDP drains on Windows (libc
+# does not expose winsock's ioctlsocket).
+windows-sys = { version = "0.52", features = ["Win32_Networking_WinSock"] }
 
 # aya-build + cargo_metadata live in the build-dependency graph only on
 # Linux; build.rs decides at runtime whether `--features kernel` is enabled

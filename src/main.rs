@@ -3,7 +3,7 @@ use std::{
     str::FromStr,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 
 mod run;
@@ -142,7 +142,7 @@ pub struct ForwarderArgs {
     pub iface: Option<String>,
 }
 
-#[tokio::main]
+#[compio::main]
 async fn main() -> Result<()> {
     env_logger::init();
 

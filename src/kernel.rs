@@ -31,8 +31,8 @@ use aya::{
     maps::Array,
     programs::{SchedClassifier, TcAttachType, Xdp, XdpMode, tc},
 };
+use compio::signal;
 use log::{info, warn};
-use tokio::signal;
 
 use crate::run::DERIVED_KEY_NUM;
 
